@@ -244,8 +244,12 @@ test.describe('refusals', () => {
     await ui.pick('tooBig');
     await ui.uploadButton.click();
 
-    await expect(ui.error).toContainText('maximum upload size');
-    await expect(ui.error).toContainText(String(E2E_MAX_FILE_BYTES));
+    // The exact message the person reads: readable sizes, exact bytes kept.
+    expect(FIXTURES.tooBig.size).toBe(42_991_616);
+    expect(E2E_MAX_FILE_BYTES).toBe(41_943_040);
+    await expect(ui.error).toHaveText(
+      'This file is 41 MB (42,991,616 bytes); the maximum upload size is 40 MB (41,943,040 bytes).',
+    );
     await expect(ui.status).toContainText('Upload failed');
     expect(partRequests).toBe(0);
   });

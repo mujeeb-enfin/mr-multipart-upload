@@ -14,6 +14,7 @@
     "app-router"
   ],
   "license": "MIT",
+  "author": "mujeeb-enfin",
   "type": "module",
   "sideEffects": false,
   "engines": {
