@@ -24,3 +24,8 @@ coverage/
 
 # Added by MR Multi Model Ai Coder
 .mrcoder/
+
+# Claude Code agent worktrees: each is a separate git checkout. Committed, they
+# become submodule pointers with no .gitmodules — empty, broken folders in every
+# clone. Anchored to the repository root.
+/.claude/
