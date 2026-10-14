@@ -1,4 +1,4 @@
-// Public server API — `mr-multipart-upload/server`.
+// Public server API — `@mr_innovations/multipart-upload/server`.
 
 export { createUploadRoutes, FINGERPRINT_HEADER, PART_CHECKSUM_HEADER } from './routes.js';
 export type { UploadRoutes, UploadRoutesOptions, RouteHandler } from './routes.js';

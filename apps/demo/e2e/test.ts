@@ -30,7 +30,7 @@ export { expect };
 
 const VISITOR_COOKIE = 'demo_visitor';
 /** Lines the server writes for real errors: Next.js's ⨯ marker, the library's tag, stack traces. */
-const SERVER_ERROR_LINE = /⨯|\[mr-multipart-upload\]|\bError\b|\bFATAL\b|ECONN|Unhandled/;
+const SERVER_ERROR_LINE = /⨯|\[multipart-upload\]|\bError\b|\bFATAL\b|ECONN|Unhandled/;
 
 function logSize(): number {
   try {

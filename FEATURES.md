@@ -1,6 +1,6 @@
 # Features
 
-`mr-multipart-upload` is a TypeScript library for resumable uploads in Next.js App Router applications. It includes HTTP route handlers, a browser upload engine, a React hook, and a filesystem storage backend.
+`@mr_innovations/multipart-upload` is a TypeScript library for resumable uploads in Next.js App Router applications. It includes HTTP route handlers, a browser upload engine, a React hook, and a filesystem storage backend.
 
 ## Uploads
 
@@ -24,9 +24,9 @@
 
 ## Integrations and configuration
 
-- Browser API: `startUpload()` from `mr-multipart-upload/client`.
-- React API: `useMultipartUpload()` from `mr-multipart-upload/react`.
-- Server API: `createUploadRoutes()` and `createUploader()` from `mr-multipart-upload/server`.
+- Browser API: `startUpload()` from `@mr_innovations/multipart-upload/client`.
+- React API: `useMultipartUpload()` from `@mr_innovations/multipart-upload/react`.
+- Server API: `createUploadRoutes()` and `createUploader()` from `@mr_innovations/multipart-upload/server`.
 - Configurable maximum file size, part size, storage directory, unfinished-upload TTL, and instance identifier through environment variables or code options.
 - Zero runtime dependencies; requires Node.js 20.9+ and is ESM-only.
 

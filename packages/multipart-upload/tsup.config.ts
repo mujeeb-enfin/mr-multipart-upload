@@ -7,7 +7,7 @@ import { defineConfig, type Options } from 'tsup';
 //
 // Why together: built separately, each bundle gets its own copy of the client
 // code, so an UploadClientError thrown inside the hook fails an `instanceof`
-// check against the UploadClientError exported from `mr-multipart-upload/client`.
+// check against the UploadClientError exported from `@mr_innovations/multipart-upload/client`.
 // Splitting puts the shared code in one chunk that both entries import, so there
 // is exactly one class.
 //

@@ -4,7 +4,7 @@ export default function Page() {
   return (
     <main className="page">
       <header className="intro">
-        <h1>mr-multipart-upload</h1>
+        <h1>multipart-upload</h1>
         <p>
           Pick a file and upload it in parts. Pause, reload the page, or lose your connection —
           picking the same file again sends only the parts the server does not have yet.

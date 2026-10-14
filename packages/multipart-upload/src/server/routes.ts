@@ -132,7 +132,7 @@ function normaliseBasePath(basePath: string): string {
 export function createUploadRoutes(options: UploadRoutesOptions = {}): UploadRoutes {
   if (!options.authorize && !options.allowAnonymous) {
     throw new Error(
-      'mr-multipart-upload: createUploadRoutes() needs an `authorize` function that returns { namespace } ' +
+      'multipart-upload: createUploadRoutes() needs an `authorize` function that returns { namespace } ' +
         'for the signed-in user. To accept anonymous uploads deliberately, pass `allowAnonymous: true`.',
     );
   }
@@ -140,7 +140,7 @@ export function createUploadRoutes(options: UploadRoutesOptions = {}): UploadRou
   const uploader = createUploader(options);
   const basePath = normaliseBasePath(options.basePath ?? '/api/uploads');
   const maxJsonBytes = (options.maxMetadataBytes ?? 16 * 1024) + JSON_OVERHEAD_BYTES;
-  const reportError = options.onError ?? ((error: unknown) => console.error('[mr-multipart-upload]', error));
+  const reportError = options.onError ?? ((error: unknown) => console.error('[multipart-upload]', error));
 
   function segmentsOf(request: Request): string[] {
     const { pathname } = new URL(request.url);

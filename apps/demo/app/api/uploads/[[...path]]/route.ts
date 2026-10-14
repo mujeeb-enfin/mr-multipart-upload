@@ -1,6 +1,6 @@
 // The whole server side of the upload: one catch-all route.
 
-import { createUploadRoutes } from 'mr-multipart-upload/server';
+import { createUploadRoutes } from '@mr_innovations/multipart-upload/server';
 
 import { readVisitorId } from '../../../visitor';
 

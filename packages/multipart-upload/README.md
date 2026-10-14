@@ -1,4 +1,4 @@
-# mr-multipart-upload
+# @mr_innovations/multipart-upload
 
 Resumable multipart file uploads for **Next.js** — App Router route handlers, a browser client and a React hook, in TypeScript.
 
@@ -12,7 +12,7 @@ Large files are sent in parts. If the connection drops, the tab closes or the se
 - **Zero runtime dependencies.**
 
 ```bash
-npm install mr-multipart-upload
+npm install @mr_innovations/multipart-upload
 ```
 
 Requires Node.js 20.9 or later and the Next.js App Router. The package is ESM-only.
@@ -25,7 +25,7 @@ Requires Node.js 20.9 or later and the Next.js App Router. The package is ESM-on
 
 ```ts
 // app/api/uploads/[[...path]]/route.ts
-import { createUploadRoutes } from 'mr-multipart-upload/server';
+import { createUploadRoutes } from '@mr_innovations/multipart-upload/server';
 import { auth } from '@/auth'; // your authentication
 
 export const runtime = 'nodejs';        // the filesystem needs the Node.js runtime
@@ -64,7 +64,7 @@ The folder name `[[...path]]` matters: it is an optional catch-all, so this sing
 
 ```tsx
 'use client';
-import { useMultipartUpload } from 'mr-multipart-upload/react';
+import { useMultipartUpload } from '@mr_innovations/multipart-upload/react';
 
 export function FileUpload() {
   const upload = useMultipartUpload({ endpoint: '/api/uploads' });
@@ -135,7 +135,7 @@ Remember to add `uploads/` (or your `dir`) to `.gitignore`.
 
 ---
 
-## Server API — `mr-multipart-upload/server`
+## Server API — `@mr_innovations/multipart-upload/server`
 
 ### `createUploadRoutes(options)`
 
@@ -180,7 +180,7 @@ There are no background timers. Expired uploads are removed when a new upload be
 
 ```ts
 // lib/uploads.ts
-import { createUploadRoutes } from 'mr-multipart-upload/server';
+import { createUploadRoutes } from '@mr_innovations/multipart-upload/server';
 export const uploads = createUploadRoutes({ authorize, onComplete });
 ```
 
@@ -205,7 +205,7 @@ export async function POST() {
 
 ## Client API
 
-### `useMultipartUpload(options)` — `mr-multipart-upload/react`
+### `useMultipartUpload(options)` — `@mr_innovations/multipart-upload/react`
 
 | Returns | |
 |---|---|
@@ -222,7 +222,7 @@ export async function POST() {
 
 Unmounting the component pauses the upload; it never discards it.
 
-### `startUpload(options)` — `mr-multipart-upload/client`
+### `startUpload(options)` — `@mr_innovations/multipart-upload/client`
 
 The framework-free engine behind the hook. Returns `{ promise, pause, discard, uploadId }`.
 
