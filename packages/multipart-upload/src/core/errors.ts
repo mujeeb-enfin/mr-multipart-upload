@@ -1,0 +1,92 @@
+// ---------------------------------------------------------------------------
+// errors.ts — one error type, one stable code per failure, one HTTP status each
+// ---------------------------------------------------------------------------
+//
+// Codes are part of the public contract: the browser client branches on them
+// (`PART_IN_FLIGHT` is retried, `FINGERPRINT_MISMATCH` is not) and applications
+// show messages keyed on them. Adding a code is fine; renaming one is a breaking
+// change.
+// ---------------------------------------------------------------------------
+
+export type UploadErrorCode =
+  /** An unfinished upload of a DIFFERENT file already uses this name. */
+  | 'NAME_IN_USE'
+  /** No upload in progress under this id for this caller. */
+  | 'NO_SESSION'
+  /** A part was sent for a different file than the session was started with. */
+  | 'FINGERPRINT_MISMATCH'
+  /** A part's body is not exactly the size its index requires. */
+  | 'PART_LENGTH_MISMATCH'
+  /** A part index outside 1..partCount. */
+  | 'PART_OUT_OF_RANGE'
+  /** The session's parts live on another server instance. */
+  | 'WRONG_INSTANCE'
+  /** `complete` was called while parts are still missing. */
+  | 'INCOMPLETE'
+  /** Another `complete` for this upload is running right now. */
+  | 'COMPLETE_IN_PROGRESS'
+  /** Another request is writing this exact part right now. Retryable. */
+  | 'PART_IN_FLIGHT'
+  /** The file needs more parts than the naming scheme supports. */
+  | 'TOO_MANY_PARTS'
+  /** The file exceeds MULTIPART_UPLOAD_MAX_FILE_BYTES. */
+  | 'FILE_TOO_LARGE'
+  /** A request body (JSON or part) is larger than allowed. */
+  | 'BODY_TOO_LARGE'
+  /** Metadata exceeds the configured cap, or is not a JSON object. */
+  | 'METADATA_TOO_LARGE'
+  /** The file name cannot be turned into a safe upload id. */
+  | 'INVALID_NAME'
+  /** The request is malformed: bad JSON, missing field, bad header. */
+  | 'INVALID_REQUEST'
+  /** `validateHead` refused the file's contents. The parts are kept. */
+  | 'REJECTED'
+  /** `authorize` returned nothing or threw. */
+  | 'UNAUTHORIZED'
+  /** No route matches the method and path. */
+  | 'NOT_FOUND'
+  /** Server configuration is invalid — an `.env` value or an option. */
+  | 'CONFIG_INVALID';
+
+const STATUS_FOR_CODE: Record<UploadErrorCode, number> = {
+  NAME_IN_USE: 409,
+  NO_SESSION: 404,
+  FINGERPRINT_MISMATCH: 409,
+  PART_LENGTH_MISMATCH: 400,
+  PART_OUT_OF_RANGE: 400,
+  WRONG_INSTANCE: 409,
+  INCOMPLETE: 409,
+  COMPLETE_IN_PROGRESS: 409,
+  // 409, not 503: nothing is wrong with the server. The client simply has to
+  // come back to this index, and it does.
+  PART_IN_FLIGHT: 409,
+  TOO_MANY_PARTS: 422,
+  FILE_TOO_LARGE: 413,
+  BODY_TOO_LARGE: 413,
+  METADATA_TOO_LARGE: 413,
+  INVALID_NAME: 400,
+  INVALID_REQUEST: 400,
+  REJECTED: 422,
+  UNAUTHORIZED: 401,
+  NOT_FOUND: 404,
+  CONFIG_INVALID: 500,
+};
+
+export class UploadError extends Error {
+  readonly code: UploadErrorCode;
+  readonly status: number;
+  /** Extra, JSON-safe context returned to the client (e.g. `missingParts`). */
+  readonly details: Record<string, unknown> | undefined;
+
+  constructor(code: UploadErrorCode, message: string, details?: Record<string, unknown>) {
+    super(message);
+    this.name = 'UploadError';
+    this.code = code;
+    this.status = STATUS_FOR_CODE[code];
+    this.details = details;
+  }
+}
+
+export function isUploadError(err: unknown): err is UploadError {
+  return err instanceof UploadError;
+}

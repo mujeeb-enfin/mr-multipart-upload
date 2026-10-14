@@ -1,0 +1,20 @@
+{
+  "name": "multipart-upload-workspace",
+  "private": true,
+  "description": "Workspace for the multipart-upload package and its Next.js demo app.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "build": "npm run build --workspace multipart-upload",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspace multipart-upload",
+    "demo:dev": "npm run build && npm run dev --workspace demo",
+    "demo:e2e": "npm run build && npm run e2e --workspace demo",
+    "check:package": "npm run check:package --workspace multipart-upload"
+  }
+}

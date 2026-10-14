@@ -1,0 +1,235 @@
+// ---------------------------------------------------------------------------
+// complete.ts — assemble the parts into one stored file
+// ---------------------------------------------------------------------------
+//
+// The ORDER of these steps is the safety argument:
+//
+//   lock        two concurrent completes cannot both assemble
+//   prune       remove wrong-size parts — safe only now, under the lock
+//   verify      refuse while any part is missing, naming which
+//   head        let the application reject the file BEFORE assembling 400 MB
+//   assemble    stream + hash in one pass; byte count must equal the manifest
+//   dedupe      identical bytes already stored -> reuse, do not duplicate
+//   promote     publish at the content-addressed key
+//   onComplete  the application records it; only then are the parts deleted
+//
+// ON FAILURE AFTER ASSEMBLY THE PARTS ARE KEPT, so a retry costs one assembly,
+// not a re-upload. The sweep reclaims them if the user gives up.
+//
+// DEDUPE IS PER NAMESPACE. The default destination includes the namespace hash.
+// A store shared across users would tell user A, through `deduplicated: true`,
+// that user B had already uploaded the identical file — a known side channel of
+// cross-user dedupe. Applications that want global dedupe can opt in through
+// `destination`, knowingly.
+// ---------------------------------------------------------------------------
+
+import { UploadError } from '../core/errors.js';
+import { FILES_DIR, PARTS_DIR, lockKey, partIndexFromFileName, partKey, sessionKey, stagingKey } from '../core/layout.js';
+import { expectedPartBytes } from '../core/arithmetic.js';
+import type { UploadMetadata } from '../core/session.js';
+import { readManifest, readSession, type StoreContext } from './store.js';
+import type { UploaderOptions } from './uploader.js';
+
+export const DEFAULT_LOCK_STALE_MS = 15 * 60 * 1000;
+const DEFAULT_HEAD_BYTES = 64 * 1024;
+
+export interface CompletedFile {
+  /** Storage key, relative to the storage root. */
+  readonly key: string;
+  /** Absolute path on disk, when the backend has one (the filesystem does). */
+  readonly localPath: string | undefined;
+  readonly size: number;
+  /** Lowercase hex SHA-256 of the stored bytes. */
+  readonly sha256: string;
+  /** The file name the user picked. */
+  readonly fileName: string;
+  /** Stream the stored file. */
+  read(): ReadableStream<Uint8Array>;
+}
+
+export interface CompleteHookInput {
+  readonly file: CompletedFile;
+  readonly metadata: UploadMetadata;
+  readonly namespace: string;
+  readonly uploadId: string;
+  /** True when identical bytes were already stored for this namespace. */
+  readonly deduplicated: boolean;
+}
+
+export interface CompleteResult {
+  readonly uploadId: string;
+  readonly fileName: string;
+  readonly key: string;
+  readonly size: number;
+  readonly sha256: string;
+  readonly deduplicated: boolean;
+  /** Whatever `onComplete` returned. */
+  readonly result: unknown;
+}
+
+/** Lowercase extension of up to 16 alphanumerics, or ''. Never a path fragment. */
+export function extensionOf(fileName: string): string {
+  const dot = fileName.lastIndexOf('.');
+  if (dot <= 0 || dot === fileName.length - 1) return '';
+  const ext = fileName.slice(dot + 1).toLowerCase();
+  return /^[a-z0-9]{1,16}$/.test(ext) ? ext : '';
+}
+
+async function acquireLock(store: StoreContext, uploadId: string, staleMs: number): Promise<void> {
+  const key = lockKey(store.namespaceKey, uploadId);
+  const stamp = new Date().toISOString();
+  if ((await store.storage.createExclusive(key, stamp)) === 'created') return;
+
+  // A lock is a file, so a process that dies mid-complete leaves it behind and
+  // the upload could never be finished. One older than `staleMs` is taken over;
+  // assembling even a multi-gigabyte file takes seconds, not minutes.
+  const info = await store.storage.stat(key);
+  if (info && Date.now() - info.modifiedMs > staleMs) {
+    await store.storage.remove(key);
+    if ((await store.storage.createExclusive(key, stamp)) === 'created') return;
+  }
+  throw new UploadError('COMPLETE_IN_PROGRESS', 'This upload is already being finalised.');
+}
+
+/** Delete parts that are present but the wrong size. Only ever under the lock. */
+async function pruneParts(store: StoreContext, uploadId: string): Promise<void> {
+  const manifest = await readManifest(store, uploadId);
+  if (!manifest) return;
+  for (const entry of await store.storage.list(sessionKey(store.namespaceKey, uploadId))) {
+    const index = partIndexFromFileName(entry);
+    if (index === null) continue;
+    const key = partKey(store.namespaceKey, uploadId, index);
+    if (index > manifest.partCount) {
+      await store.storage.remove(key);
+      continue;
+    }
+    const info = await store.storage.stat(key);
+    if (!info || info.isDirectory || info.size !== expectedPartBytes(index, manifest.partBytes, manifest.totalBytes)) {
+      await store.storage.remove(key);
+    }
+  }
+}
+
+function destinationFor(
+  store: StoreContext,
+  options: UploaderOptions,
+  sha256: string,
+  fileName: string,
+): string {
+  const extension = extensionOf(fileName);
+  const key = options.destination
+    ? options.destination({ sha256, extension, namespaceKey: store.namespaceKey, fileName })
+    : `${FILES_DIR}/${store.namespaceKey}/${sha256}${extension ? `.${extension}` : ''}`;
+  if (typeof key !== 'string' || key.length === 0) {
+    throw new UploadError('CONFIG_INVALID', 'destination() must return a non-empty storage key');
+  }
+  // Anything under .parts would be reaped by the sweep as an abandoned upload.
+  if (key === PARTS_DIR || key.startsWith(`${PARTS_DIR}/`) || key.startsWith(`${PARTS_DIR}\\`)) {
+    throw new UploadError('CONFIG_INVALID', `destination() must not point inside ${PARTS_DIR}/`);
+  }
+  return key;
+}
+
+export async function completeUpload(
+  store: StoreContext,
+  uploadId: string,
+  namespace: string,
+  options: UploaderOptions,
+): Promise<CompleteResult> {
+  // Checked BEFORE locking: creating the lock file would otherwise create an
+  // empty session directory for an upload that never existed.
+  if (!(await readManifest(store, uploadId))) {
+    throw new UploadError('NO_SESSION', `No upload in progress for "${uploadId}"`);
+  }
+  await acquireLock(store, uploadId, options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS);
+
+  const staging = stagingKey(store.namespaceKey, uploadId);
+  let stagingExists = false;
+
+  try {
+    await pruneParts(store, uploadId);
+
+    const session = await readSession(store, uploadId);
+    const { manifest } = session;
+    if (!session.complete) {
+      throw new UploadError('INCOMPLETE', `${session.missingParts.length} part(s) have not been uploaded yet.`, {
+        missingParts: session.missingParts.slice(0, 50),
+      });
+    }
+
+    if (options.validateHead) {
+      const head = await store.storage.readHead(
+        partKey(store.namespaceKey, uploadId, 1),
+        options.headBytes ?? DEFAULT_HEAD_BYTES,
+      );
+      try {
+        await options.validateHead(head, {
+          fileName: manifest.fileName,
+          totalBytes: manifest.totalBytes,
+          metadata: manifest.metadata,
+          namespace,
+        });
+      } catch (err) {
+        // Parts deliberately kept: the check may be wrong, and the sweep
+        // reclaims them otherwise.
+        if (err instanceof UploadError) throw err;
+        throw new UploadError('REJECTED', err instanceof Error ? err.message : 'The file was rejected.');
+      }
+    }
+
+    const partKeys = Array.from({ length: manifest.partCount }, (_, i) =>
+      partKey(store.namespaceKey, uploadId, i + 1),
+    );
+    stagingExists = true;
+    const assembly = await store.storage.assemble(partKeys, staging);
+    if (assembly.bytesWritten !== manifest.totalBytes) {
+      // Upstream size checks should make this unreachable. If it fires one of them
+      // is wrong, and storing the file would record bytes that do not match the
+      // declared size — so fail loudly instead.
+      throw new UploadError(
+        'PART_LENGTH_MISMATCH',
+        `Assembled ${assembly.bytesWritten} bytes but the upload declared ${manifest.totalBytes}.`,
+      );
+    }
+
+    const key = destinationFor(store, options, assembly.sha256, manifest.fileName);
+    const deduplicated = (await store.storage.stat(key)) !== null;
+    if (deduplicated) {
+      // The content-addressed key already holds these exact bytes. `rename` would
+      // silently replace it, so the duplicate is dropped explicitly instead.
+      await store.storage.remove(staging);
+    } else {
+      await store.storage.promote(staging, key);
+    }
+    stagingExists = false;
+
+    const file: CompletedFile = {
+      key,
+      localPath: store.storage.localPath?.(key),
+      size: assembly.bytesWritten,
+      sha256: assembly.sha256,
+      fileName: manifest.fileName,
+      read: () => store.storage.openRead(key),
+    };
+
+    let result: unknown = null;
+    if (options.onComplete) {
+      try {
+        result = (await options.onComplete({ file, metadata: manifest.metadata, namespace, uploadId, deduplicated })) ?? null;
+      } catch (err) {
+        // A file nothing has recorded is invisible and would never be deleted.
+        // Remove it — unless it pre-existed, in which case it belongs to an
+        // earlier upload and must stay. The parts are kept for a retry.
+        if (!deduplicated) await store.storage.remove(key).catch(() => undefined);
+        throw err;
+      }
+    }
+
+    await store.storage.removeTree(sessionKey(store.namespaceKey, uploadId));
+    return { uploadId, fileName: manifest.fileName, key, size: assembly.bytesWritten, sha256: assembly.sha256, deduplicated, result };
+  } finally {
+    if (stagingExists) await store.storage.remove(staging).catch(() => undefined);
+    // Absent after a successful complete (the session tree is gone): a no-op.
+    await store.storage.remove(lockKey(store.namespaceKey, uploadId)).catch(() => undefined);
+  }
+}

@@ -1,0 +1,9 @@
+# Normalise to LF in the repository and the working tree. The package is
+# developed on Windows as well as Linux, and a stray CR in a script or snapshot
+# breaks things at runtime rather than merely churning a diff.
+* text=auto eol=lf
+
+*.png  binary
+*.jpg  binary
+*.ico  binary
+*.woff2 binary

@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+coverage/
+
+# Uploaded files written by tests and the demo. Anchored to their own
+# directories: an unanchored `uploads/` also ignores source folders that happen
+# to share the name, which once hid five route files from a commit.
+/apps/demo/uploads/
+/packages/multipart-upload/.test-uploads/
+
+# Playwright
+/apps/demo/test-results/
+/apps/demo/playwright-report/
+/apps/demo/e2e/.fixtures/
+
+.env
+.env.local
+*.log
+.DS_Store
