@@ -21,3 +21,6 @@ coverage/
 *.log
 .DS_Store
 .vscode
+
+# Added by MR Multi Model Ai Coder
+.mrcoder/
