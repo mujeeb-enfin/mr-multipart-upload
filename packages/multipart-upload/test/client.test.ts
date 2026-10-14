@@ -192,9 +192,12 @@ describe('startUpload', () => {
   });
 
   it('discard deletes the server-side parts', async () => {
+    // Awaits the discard itself. An earlier version fired it and then slept a
+    // fixed 20 ms before checking; under parallel test load the DELETE sometimes
+    // took longer, and the check failed in 5 of 15 runs.
     const bytes = patternBytes(4 * MIB);
     let handle: ReturnType<typeof startUpload>;
-    let count = 0;
+    let discarding: Promise<void> | null = null;
     handle = startUpload({
       file: fileFrom(bytes, 'd.bin'),
       headers: auth,
@@ -202,14 +205,17 @@ describe('startUpload', () => {
       concurrency: 1,
       sendPart: async (req) => {
         const res = await fetchPartSender(dispatch)(req);
-        if (++count === 1) void handle.discard();
+        discarding ??= handle.discard();
         return res;
       },
     });
-    await handle.promise.catch(() => undefined);
-    await tick(20);
+    const outcome = await handle.promise.catch((e: unknown) => e);
+    expect((outcome as UploadClientError).code).toBe('PAUSED');
+    expect(discarding).not.toBeNull();
+    await discarding;
     const status = await dispatch('/api/uploads/d-bin', { headers: auth });
     expect(status.status).toBe(404);
+    expect(((await status.json()) as { error: { code: string } }).error.code).toBe('NO_SESSION');
   });
 
   it('sends the caller headers so authorize can identify the user', async () => {
