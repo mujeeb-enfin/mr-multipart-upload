@@ -74,7 +74,7 @@ describe('the full flow over HTTP', () => {
     expect(first.status).toBe(201);
     expect(first.headers.get('cache-control')).toBe('no-store');
     const session = (await first.json()) as { uploadId: string; partCount: number; missingParts: number[]; maxFileBytes: number };
-    expect(session).toMatchObject({ uploadId: 'talk-m4a', partCount: 3, missingParts: [1, 2, 3], maxFileBytes: 1024 * MIB });
+    expect(session).toMatchObject({ uploadId: 'talk-m4a', partCount: 3, missingParts: [1, 2, 3], maxFileBytes: 500 * MIB });
 
     expect((await r.PUT(partRequest('talk-m4a', 1, partOf(bytes, 1, MIB)))).status).toBe(200);
 

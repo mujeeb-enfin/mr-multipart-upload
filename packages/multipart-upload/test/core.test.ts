@@ -13,6 +13,7 @@ import { describe, expect, it } from 'vitest';
 
 import { expectedPartBytes, partByteRange, partCountFor } from '../src/core/arithmetic.js';
 import { UploadError } from '../src/core/errors.js';
+import { describeByteSize, formatByteSize } from '../src/core/format.js';
 import {
   LOCK_FILE,
   MANIFEST_FILE,
@@ -244,5 +245,21 @@ describe('upload ids from file names', () => {
     const id = slugifyFileName(`${'a'.repeat(79)} b`);
     expect(id.length).toBeLessThanOrEqual(80);
     expect(id.endsWith('-')).toBe(false);
+  });
+});
+
+describe('byte sizes in messages', () => {
+  // Protects the refusal message people read: "189963874 bytes" was shown raw.
+  it('formats sizes in the units a file picker shows', () => {
+    expect(formatByteSize(512)).toBe('512 B');
+    expect(formatByteSize(1536)).toBe('1.5 KB');
+    expect(formatByteSize(40 * MIB)).toBe('40 MB');
+    expect(formatByteSize(189_963_874)).toBe('181 MB');
+    expect(formatByteSize(1.5 * 1024 * MIB)).toBe('1.5 GB');
+  });
+
+  it('keeps the exact byte count alongside', () => {
+    expect(describeByteSize(189_963_874)).toBe('181 MB (189,963,874 bytes)');
+    expect(describeByteSize(41_943_040)).toBe('40 MB (41,943,040 bytes)');
   });
 });

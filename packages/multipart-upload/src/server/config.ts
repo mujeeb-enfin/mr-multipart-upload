@@ -2,7 +2,7 @@
 // config.ts — configuration from .env, overridable in code
 // ---------------------------------------------------------------------------
 //
-//   MULTIPART_UPLOAD_MAX_FILE_BYTES   largest file accepted        default 1 GiB
+//   MULTIPART_UPLOAD_MAX_FILE_BYTES   largest file accepted        default 500 MiB
 //   MULTIPART_UPLOAD_PART_BYTES       bytes per part, 1–8 MiB      default 2 MiB
 //   MULTIPART_UPLOAD_DIR              storage root                 default ./uploads
 //   MULTIPART_UPLOAD_PART_TTL_HOURS   unfinished uploads expire    default 48
@@ -27,7 +27,7 @@ export const MIB = 1024 * 1024;
 export const MIN_PART_BYTES = 1 * MIB;
 export const MAX_PART_BYTES = 8 * MIB;
 
-const DEFAULT_MAX_FILE_BYTES = 1024 * MIB;
+const DEFAULT_MAX_FILE_BYTES = 500 * MIB;
 const DEFAULT_PART_BYTES = 2 * MIB;
 const DEFAULT_DIR = './uploads';
 const DEFAULT_PART_TTL_HOURS = 48;

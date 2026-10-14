@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 
 import { expectedPartBytes, partCountFor } from '../core/arithmetic.js';
 import { UploadError } from '../core/errors.js';
+import { describeByteSize } from '../core/format.js';
 import { lockKey, manifestKey, namespaceDirKey, partKey, sessionKey } from '../core/layout.js';
 import { type UploadManifest, type UploadMetadata, type UploadSession, manifestMatches, summariseSession } from '../core/session.js';
 import { assertSafeUploadId, uploadIdForFileName } from '../core/slug.js';
@@ -155,7 +156,7 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     if (totalBytes > config.maxFileBytes) {
       throw new UploadError(
         'FILE_TOO_LARGE',
-        `File is ${totalBytes} bytes; the maximum upload size is ${config.maxFileBytes} bytes.`,
+        `This file is ${describeByteSize(totalBytes)}; the maximum upload size is ${describeByteSize(config.maxFileBytes)}.`,
         { maxFileBytes: config.maxFileBytes },
       );
     }

@@ -19,9 +19,9 @@ import { MIB, clearEnv } from './helpers.js';
 afterEach(clearEnv);
 
 describe('defaults', () => {
-  it('are 1 GiB max, 2 MiB parts, ./uploads, 48 h, single instance', () => {
+  it('are 500 MiB max, 2 MiB parts, ./uploads, 48 h, single instance', () => {
     const cfg = resolveConfig();
-    expect(cfg.maxFileBytes).toBe(1024 * MIB);
+    expect(cfg.maxFileBytes).toBe(524_288_000); // 500 MiB — must match README and .env.example
     expect(cfg.partBytes).toBe(2 * MIB);
     expect(cfg.partTtlMs).toBe(48 * 3_600_000);
     expect(cfg.instanceId).toBe('single');
@@ -56,7 +56,7 @@ describe('MULTIPART_UPLOAD_MAX_FILE_BYTES', () => {
 
   it('treats an empty value as unset', () => {
     process.env.MULTIPART_UPLOAD_MAX_FILE_BYTES = '   ';
-    expect(resolveConfig().maxFileBytes).toBe(1024 * MIB);
+    expect(resolveConfig().maxFileBytes).toBe(500 * MIB);
   });
 
   it('refuses a limit that would need more parts than the naming scheme allows', () => {

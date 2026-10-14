@@ -7,7 +7,8 @@ First release.
 - Next.js App Router route handlers from a single `createUploadRoutes()` call, mounted on one optional catch-all route.
 - Browser client (`startUpload`) and React hook (`useMultipartUpload`) with pause, resume and discard.
 - Resume derived entirely from the filesystem — no database, no stored tokens.
-- Configuration from `.env`, including `MULTIPART_UPLOAD_MAX_FILE_BYTES`, validated strictly.
+- Configuration from `.env`, including `MULTIPART_UPLOAD_MAX_FILE_BYTES` (default 500 MiB), validated strictly.
+- A refused oversized file is described in readable sizes, with the exact byte counts kept: "This file is 181 MB (189,963,874 bytes); the maximum upload size is 40 MB (41,943,040 bytes)."
 - Per-user namespaces, required `authorize`, per-user deduplication.
 - Request body limits enforced in the route, including when `Content-Length` is missing or wrong.
 - `validateHead` and `onComplete` hooks; configurable `destination`.

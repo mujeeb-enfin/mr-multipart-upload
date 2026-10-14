@@ -87,7 +87,7 @@ Every variable is optional. To change one, add it to your app's `.env.local` (or
 
 ```bash
 # .env.local
-MULTIPART_UPLOAD_MAX_FILE_BYTES=1073741824   # 1 GiB — largest file accepted
+MULTIPART_UPLOAD_MAX_FILE_BYTES=524288000    # 500 MiB — largest file accepted
 MULTIPART_UPLOAD_PART_BYTES=2097152          # 2 MiB — between 1048576 and 8388608
 MULTIPART_UPLOAD_DIR=./uploads               # persistent, writable directory
 MULTIPART_UPLOAD_PART_TTL_HOURS=48           # unfinished uploads are removed after this
@@ -98,7 +98,7 @@ Remember to add `uploads/` (or your `MULTIPART_UPLOAD_DIR`) to `.gitignore`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MULTIPART_UPLOAD_MAX_FILE_BYTES` | `1073741824` (1 GiB) | Largest file accepted, in bytes. |
+| `MULTIPART_UPLOAD_MAX_FILE_BYTES` | `524288000` (500 MiB) | Largest file accepted, in bytes. |
 | `MULTIPART_UPLOAD_PART_BYTES` | `2097152` (2 MiB) | Bytes per part, between 1 MiB and 8 MiB. |
 | `MULTIPART_UPLOAD_DIR` | `./uploads` | Where parts and finished files are stored. |
 | `MULTIPART_UPLOAD_PART_TTL_HOURS` | `48` | Unfinished uploads untouched this long are removed. |

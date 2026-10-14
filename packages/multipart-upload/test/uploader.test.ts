@@ -110,6 +110,10 @@ describe('begin and resume', () => {
     expect(err.code).toBe('FILE_TOO_LARGE');
     expect(err.status).toBe(413);
     expect(err.details).toEqual({ maxFileBytes: 2 * MIB });
+    // Readable sizes for the person, exact bytes kept for support.
+    expect(err.message).toBe(
+      'This file is 2 MB (2,097,153 bytes); the maximum upload size is 2 MB (2,097,152 bytes).',
+    );
     expect(await readdir(root)).toEqual([]); // nothing created
     // Exactly at the limit is accepted.
     expect((await up.begin(ALICE, { fileName: 'ok.bin', totalBytes: 2 * MIB, fingerprint: 'fp' })).created).toBe(true);
