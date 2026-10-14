@@ -106,7 +106,12 @@ describe('startUpload', () => {
   it('retries a 429 and then really runs one part at a time', async () => {
     // MUTATION: remove the worker slot check -> after the 429 four parts still
     // run concurrently and `maxAfterThrottle` is 4.
-    const bytes = patternBytes(12 * MIB);
+    // Sized so the overlap is GUARANTEED, not likely: the throttled part retries
+    // after a fixed 200 ms Retry-After, and the surviving worker still has ~20
+    // parts x 60 ms = 1.2 s of work at that moment. An earlier version used 12
+    // parts and jittered backoff; worker 0 usually finished first, so removing
+    // the requeue fix went undetected (found by mutation testing).
+    const bytes = patternBytes(24 * MIB);
     const run = await throttledRun(bytes);
     expect(run.sha256).toBe(sha256(bytes));
     expect(run.rejected429).toBe(1);
@@ -233,11 +238,12 @@ async function throttledRun(bytes: Uint8Array<ArrayBuffer>) {
     // `+ 4`: up to four parts (the initial concurrency) were already running.
     else if (started > throttledAt + 4) maxConcurrencyAfterDrain = Math.max(maxConcurrencyAfterDrain, inFlight);
     try {
-      await tick(15);
+      await tick(60);
       if (throttledAt < 0 && req.url.endsWith('/parts/2')) {
         throttledAt = started;
         rejected429 += 1;
-        return { status: 429, body: { error: { code: 'RATE_LIMITED', message: 'slow down' } }, retryAfterSeconds: null };
+        // A fixed Retry-After removes backoff jitter from the timing.
+        return { status: 429, body: { error: { code: 'RATE_LIMITED', message: 'slow down' } }, retryAfterSeconds: 0.2 };
       }
       return await fetchPartSender(dispatch)(req);
     } finally {
