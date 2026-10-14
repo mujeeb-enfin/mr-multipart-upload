@@ -1,6 +1,6 @@
 // Public server API — `multipart-upload/server`.
 
-export { createUploadRoutes, FINGERPRINT_HEADER } from './routes.js';
+export { createUploadRoutes, FINGERPRINT_HEADER, PART_CHECKSUM_HEADER } from './routes.js';
 export type { UploadRoutes, UploadRoutesOptions, RouteHandler } from './routes.js';
 
 export { createUploader } from './uploader.js';

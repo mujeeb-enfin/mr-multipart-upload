@@ -7,6 +7,8 @@
 // one user can never read, resume, complete or discard another user's upload.
 // ---------------------------------------------------------------------------
 
+import { createHash } from 'node:crypto';
+
 import { expectedPartBytes, partCountFor } from '../core/arithmetic.js';
 import { UploadError } from '../core/errors.js';
 import { lockKey, manifestKey, namespaceDirKey, partKey, sessionKey } from '../core/layout.js';
@@ -70,6 +72,13 @@ export interface PutPartInput {
   readonly index: number;
   readonly bytes: Uint8Array;
   readonly fingerprint: string;
+  /**
+   * Lowercase hex SHA-256 of the part, computed by the client BEFORE sending.
+   * When present, a part whose received bytes hash differently is refused and
+   * nothing is written. Optional: browsers can only compute it in a secure
+   * context (HTTPS or localhost).
+   */
+  readonly sha256?: string;
 }
 
 export interface PutPartResult {
@@ -235,6 +244,19 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     const expected = expectedPartBytes(index, manifest.partBytes, manifest.totalBytes);
     if (bytes.byteLength !== expected) {
       throw new UploadError('PART_LENGTH_MISMATCH', `Part ${index} must be ${expected} bytes, received ${bytes.byteLength}.`);
+    }
+    // The length check cannot catch bytes that arrive at the right length but
+    // with the wrong content — which a WebKit build was found doing in testing:
+    // every part carried part 1's bytes, every size check passed, and the upload
+    // "succeeded". The client's checksum turns that into a loud, retryable error.
+    if (input.sha256 !== undefined) {
+      const actual = createHash('sha256').update(bytes).digest('hex');
+      if (actual !== input.sha256) {
+        throw new UploadError(
+          'PART_CHECKSUM_MISMATCH',
+          `Part ${index} arrived with different content from what was sent (checksum mismatch). Nothing was stored; send the part again.`,
+        );
+      }
     }
 
     // Named with this upload's part tag, so an orphan of another file under the

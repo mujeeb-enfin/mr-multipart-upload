@@ -1,6 +1,6 @@
 // Public browser API — `multipart-upload/client`. Contains no Node.js code.
 
-export { startUpload, FINGERPRINT_HEADER } from './upload.js';
+export { startUpload, FINGERPRINT_HEADER, PART_CHECKSUM_HEADER } from './upload.js';
 export type {
   StartUploadOptions,
   UploadHandle,

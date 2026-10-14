@@ -157,6 +157,23 @@ describe('parts', () => {
     expect(await codeOf(up.putPart(BOB, { uploadId: 'f-bin', index: 1, bytes: partOf(bytes, 1, MIB), fingerprint: fp }))).toBe('NO_SESSION');
   });
 
+  it('verifies a part against the checksum sent with it, and stores nothing on a mismatch', async () => {
+    const up = uploaderWith();
+    const bytes = patternBytes(SIZE);
+    const fp = fingerprintOf(bytes, 'f.bin');
+    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp });
+    const part2 = partOf(bytes, 2, MIB);
+
+    // Right length, wrong content, true checksum of the intended bytes.
+    const wrong = await codeOf(up.putPart(ALICE, { uploadId: 'f-bin', index: 2, bytes: partOf(bytes, 1, MIB), fingerprint: fp, sha256: sha256(part2) }));
+    expect(wrong).toBe('PART_CHECKSUM_MISMATCH');
+    expect((await up.status(ALICE, 'f-bin')).missingParts).toContain(2); // nothing written
+
+    const ok = await up.putPart(ALICE, { uploadId: 'f-bin', index: 2, bytes: part2, fingerprint: fp, sha256: sha256(part2) });
+    expect(ok.alreadyPresent).toBe(false);
+    expect((await up.status(ALICE, 'f-bin')).missingParts).not.toContain(2);
+  });
+
   it('lets exactly one of several concurrent writes of one part win, with correct bytes', async () => {
     const up = uploaderWith();
     const bytes = patternBytes(SIZE);

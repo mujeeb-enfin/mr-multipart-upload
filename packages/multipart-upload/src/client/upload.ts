@@ -35,6 +35,24 @@ import { fingerprintFor } from './fingerprint.js';
 import { type PartSender, xhrPartSender } from './transport.js';
 
 export const FINGERPRINT_HEADER = 'x-upload-fingerprint';
+/** Lowercase hex SHA-256 of a part, verified by the server before it is written. */
+export const PART_CHECKSUM_HEADER = 'x-part-sha256';
+
+/**
+ * SHA-256 of a part, or null where the browser cannot compute it.
+ *
+ * `crypto.subtle` exists only in secure contexts (HTTPS, or localhost). On a
+ * plain-HTTP host the checksum is skipped and the server does not verify — the
+ * upload still works, without the transit-integrity guarantee.
+ */
+async function sha256Hex(bytes: ArrayBuffer): Promise<string | null> {
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) return null;
+  const digest = new Uint8Array(await subtle.digest('SHA-256', bytes));
+  let hex = '';
+  for (const byte of digest) hex += byte.toString(16).padStart(2, '0');
+  return hex;
+}
 
 const DEFAULT_CONCURRENCY = 4;
 const DEFAULT_MAX_ATTEMPTS = 5;
@@ -209,7 +227,15 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
    *   and the part must be retried by the remaining worker instead.
    */
   async function uploadOne(index: number, slot: number): Promise<'done' | 'requeue'> {
-    const body = sliceFor(index);
+    // Read once, hash once, and send exactly the bytes that were hashed — reused
+    // across retries. See transport.ts for why this is an ArrayBuffer.
+    const body = await sliceFor(index).arrayBuffer();
+    const checksum = await sha256Hex(body);
+    const partHeaders: Record<string, string> = {
+      'content-type': 'application/octet-stream',
+      [FINGERPRINT_HEADER]: fingerprint,
+      ...(checksum ? { [PART_CHECKSUM_HEADER]: checksum } : {}),
+    };
     for (;;) {
       const attempt = (attemptsByPart.get(index) ?? 0) + 1;
       attemptsByPart.set(index, attempt);
@@ -219,7 +245,7 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
         body,
         credentials,
         signal: controller.signal,
-        headers: await headers({ 'content-type': 'application/octet-stream', [FINGERPRINT_HEADER]: fingerprint }),
+        headers: await headers(partHeaders),
         onProgress: (loaded) => {
           if (settled.has(index)) return;
           sentByPart.set(index, loaded);
@@ -241,7 +267,7 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
 
       if (!failure) {
         settled.add(index);
-        sentByPart.set(index, body.size); // pinned: never written again
+        sentByPart.set(index, body.byteLength); // pinned: never written again
         report();
         return 'done';
       }

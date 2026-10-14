@@ -185,6 +185,19 @@ describe('request validation', () => {
     }
   });
 
+  it('passes a valid part checksum through, and refuses a malformed one', async () => {
+    const r = routes();
+    const bytes = patternBytes(MIB);
+    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: MIB, fingerprint: 'fp' }));
+    const put = (checksum: string) =>
+      r.PUT(new Request(`${BASE}/a-bin/parts/1`, { method: 'PUT', headers: { ...asUser, 'x-upload-fingerprint': 'fp', 'x-part-sha256': checksum }, body: bytes }));
+    expect(await errorCode(await put('NOT-HEX'))).toBe('INVALID_REQUEST');
+    const mismatch = await put('0'.repeat(64));
+    expect(mismatch.status).toBe(422);
+    expect(await errorCode(mismatch)).toBe('PART_CHECKSUM_MISMATCH');
+    expect((await put(sha256(bytes))).status).toBe(200);
+  });
+
   it('rejects malformed JSON and unsafe upload ids', async () => {
     const r = routes();
     const bad = await r.POST(new Request(BASE, { method: 'POST', headers: asUser, body: '{nope' }));

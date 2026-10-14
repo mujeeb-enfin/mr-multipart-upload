@@ -34,6 +34,8 @@ import { sessionView } from './store.js';
 import { createUploader, type UploadContext, type Uploader, type UploaderOptions } from './uploader.js';
 
 export const FINGERPRINT_HEADER = 'x-upload-fingerprint';
+/** Optional: lowercase hex SHA-256 of the part, computed by the client before sending. */
+export const PART_CHECKSUM_HEADER = 'x-part-sha256';
 
 export interface UploadRoutesOptions extends UploaderOptions {
   /** URL path the route is mounted at. Default '/api/uploads'. */
@@ -238,13 +240,23 @@ export function createUploadRoutes(options: UploadRoutesOptions = {}): UploadRou
       }
       const fingerprint = request.headers.get(FINGERPRINT_HEADER);
       if (!fingerprint) throw new UploadError('INVALID_REQUEST', `Missing ${FINGERPRINT_HEADER} header.`);
+      const checksum = request.headers.get(PART_CHECKSUM_HEADER);
+      if (checksum !== null && !/^[0-9a-f]{64}$/.test(checksum)) {
+        throw new UploadError('INVALID_REQUEST', `${PART_CHECKSUM_HEADER} must be a lowercase hex SHA-256.`);
+      }
 
       // Capped at the largest part ANY manifest can have, not the current
       // setting: a part size lowered mid-upload must not reject the parts of an
       // upload that began under the old one. The exact size is checked next.
       const bytes = await readBodyCapped(request, MAX_PART_BYTES, 'Part');
       return json(
-        await uploader.putPart(ctx, { uploadId: segments[0] as string, index: Number(rawIndex), bytes, fingerprint }),
+        await uploader.putPart(ctx, {
+          uploadId: segments[0] as string,
+          index: Number(rawIndex),
+          bytes,
+          fingerprint,
+          ...(checksum !== null ? { sha256: checksum } : {}),
+        }),
       );
     }),
 

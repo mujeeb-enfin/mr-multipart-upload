@@ -244,6 +244,8 @@ Each part's name carries a **tag derived from the file's fingerprint**, binding 
 
 Parts are created with an exclusive-create flag, so two simultaneous attempts at the same part can never interleave.
 
+**Every part is checksummed in transit.** The browser computes each part's SHA-256 before sending it, and the server verifies it before writing anything. A part altered on the way — by a proxy, a network fault, or a browser bug — is refused with a retryable `PART_CHECKSUM_MISMATCH` instead of being stored. If it keeps happening, the upload fails loudly; it never "succeeds" with a corrupted file. This was found to matter in practice: during testing, a WebKit build sent the wrong bytes for sliced `Blob`s at the correct length, which passed every size check. (The client therefore sends each part as an `ArrayBuffer`, which was correct in every engine tested.) Checksums need the browser's built-in hashing, available only in secure contexts — HTTPS or `localhost`. On plain HTTP the upload still works, without this guarantee.
+
 **The one remaining blind spot:** two *different* files with the same name, size and modification time whose first and last 64 KB are also identical — differing only in the middle — get the same fingerprint, and the second would resume onto the first's parts. If your users may produce such files, include something that distinguishes them in the file name.
 
 ---
@@ -285,6 +287,7 @@ Every error response is `{ "error": { "code", "message", "details"? } }`.
 | `WRONG_INSTANCE` | 409 | The upload's parts are on another server. |
 | `NO_SESSION` | 404 | No such upload for this user. |
 | `PART_LENGTH_MISMATCH` | 400 | A part of the wrong size. |
+| `PART_CHECKSUM_MISMATCH` | 422 | A part's bytes changed in transit. Nothing stored; retried automatically. |
 | `PART_OUT_OF_RANGE` | 400 | A part number outside the upload. |
 | `INVALID_NAME` | 400 | The file name has no Latin letter or digit to build an id from. |
 | `INVALID_REQUEST` | 400 | A malformed request. |

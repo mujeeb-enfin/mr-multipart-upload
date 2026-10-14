@@ -17,6 +17,12 @@ export type UploadErrorCode =
   | 'FINGERPRINT_MISMATCH'
   /** A part's body is not exactly the size its index requires. */
   | 'PART_LENGTH_MISMATCH'
+  /**
+   * A part's bytes do not match the SHA-256 the client computed before sending —
+   * altered in transit. Nothing is written. Retryable: transient corruption
+   * clears on a resend; a persistent cause fails loudly after the retries.
+   */
+  | 'PART_CHECKSUM_MISMATCH'
   /** A part index outside 1..partCount. */
   | 'PART_OUT_OF_RANGE'
   /** The session's parts live on another server instance. */
@@ -58,6 +64,7 @@ const STATUS_FOR_CODE: Record<UploadErrorCode, number> = {
   NO_SESSION: 404,
   FINGERPRINT_MISMATCH: 409,
   PART_LENGTH_MISMATCH: 400,
+  PART_CHECKSUM_MISMATCH: 422,
   PART_OUT_OF_RANGE: 400,
   WRONG_INSTANCE: 409,
   INCOMPLETE: 409,

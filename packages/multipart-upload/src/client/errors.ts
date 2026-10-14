@@ -34,5 +34,8 @@ export function isRetryable(status: number, code: string | undefined): boolean {
   if (status === 0) return code !== 'PAUSED';
   if (status === 408 || status === 429) return true;
   if (status === 409 && code === 'PART_IN_FLIGHT') return true;
+  // Bytes altered in transit: a resend may arrive intact. A persistent cause
+  // fails loudly once the attempts run out — never as a corrupted file.
+  if (code === 'PART_CHECKSUM_MISMATCH') return true;
   return status >= 500;
 }

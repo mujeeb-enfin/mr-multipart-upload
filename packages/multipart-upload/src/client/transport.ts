@@ -11,13 +11,21 @@
 // A sender RESOLVES with any HTTP response, error statuses included, and REJECTS
 // only when no response arrived (status 0) or the request was aborted. The
 // uploader classifies statuses; the sender just reports them.
+//
+// THE BODY IS AN ArrayBuffer, NOT A Blob. In testing, a WebKit build sent the
+// wrong bytes for a sliced Blob: every part went out containing part 1, at the
+// correct length, so every size check passed and the upload "succeeded" with a
+// corrupted file. Reading the slice into an ArrayBuffer and sending that was
+// correct in Chromium, Firefox and WebKit alike. The cost is the parts in flight
+// held in memory — 4 x 2 MiB by default.
 // ---------------------------------------------------------------------------
 
 import { UploadClientError } from './errors.js';
 
 export interface PartRequest {
   readonly url: string;
-  readonly body: Blob;
+  /** The part's bytes, already read from the file. Never a Blob — see above. */
+  readonly body: ArrayBuffer;
   readonly headers: Record<string, string>;
   readonly credentials: RequestCredentials;
   readonly signal: AbortSignal;
@@ -103,7 +111,7 @@ export function fetchPartSender(fetchImpl: typeof fetch = fetch): PartSender {
     } catch {
       body = null;
     }
-    if (response.ok) request.onProgress(request.body.size);
+    if (response.ok) request.onProgress(request.body.byteLength);
     return { status: response.status, body, retryAfterSeconds: parseRetryAfter(response.headers.get('retry-after')) };
   };
 }

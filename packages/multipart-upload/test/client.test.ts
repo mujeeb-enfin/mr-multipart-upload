@@ -250,6 +250,44 @@ describe('startUpload', () => {
     expect(listed.uploads).toEqual([]);
   });
 
+  it('never stores a file whose parts arrived with the wrong bytes — the WebKit failure mode', async () => {
+    // A WebKit build was found sending part 1's bytes as every part, at the right
+    // length: every size check passed and the upload "succeeded" corrupted. This
+    // transport does the same. The checksum must make it fail LOUDLY instead.
+    // MUTATION: drop the server's checksum verification -> the upload completes
+    // with a SHA-256 that matches neither file.
+    const bytes = patternBytes(3 * MIB);
+    let attempts = 0;
+    const wrongBytes: PartSender = async (req) => {
+      attempts += 1;
+      const firstPart = bytes.slice(0, req.body.byteLength).buffer; // part 1's bytes, right length
+      return fetchPartSender(dispatch)({ ...req, body: firstPart });
+    };
+    const err = await startUpload({ file: fileFrom(bytes, 'webkit.bin'), headers: auth, fetch: dispatch, sendPart: wrongBytes, concurrency: 1, maxAttemptsPerPart: 3 })
+      .promise.catch((e: unknown) => e);
+    expect((err as UploadClientError).code).toBe('PART_CHECKSUM_MISMATCH');
+    expect(attempts).toBe(1 + 3); // part 1 is genuinely right; part 2 fails 3 times, retried
+    const listed = (await (await dispatch('/api/uploads', { headers: auth })).json()) as { uploads: { receivedBytes: number }[] };
+    expect(listed.uploads[0]?.receivedBytes).toBe(MIB); // only the genuine part 1 was stored
+  });
+
+  it('recovers when bytes are corrupted once in transit', async () => {
+    const bytes = patternBytes(3 * MIB);
+    let corrupted = false;
+    const flaky: PartSender = async (req) => {
+      if (!corrupted && req.url.endsWith('/parts/2')) {
+        corrupted = true;
+        const damaged = new Uint8Array(req.body.slice(0));
+        damaged[100] = (damaged[100] as number) ^ 0xff;
+        return fetchPartSender(dispatch)({ ...req, body: damaged.buffer });
+      }
+      return fetchPartSender(dispatch)(req);
+    };
+    const result = await startUpload({ file: fileFrom(bytes, 'flaky.bin'), headers: auth, fetch: dispatch, sendPart: flaky }).promise;
+    expect(corrupted).toBe(true);
+    expect(result.sha256).toBe(sha256(bytes));
+  });
+
   it('refuses an empty file with a message that says so', async () => {
     const err = await startUpload({ file: fileFrom(new Uint8Array(0), 'empty.txt'), headers: auth, fetch: dispatch }).promise.catch((e: unknown) => e);
     expect((err as UploadClientError).code).toBe('INVALID_REQUEST');
