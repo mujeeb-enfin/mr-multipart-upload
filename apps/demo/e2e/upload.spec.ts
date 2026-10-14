@@ -1,185 +1,252 @@
 // ---------------------------------------------------------------------------
-// upload.spec.ts — the demo app in a real browser against `next start`
+// upload.spec.ts — the upload journey in a real browser against `next start`
 // ---------------------------------------------------------------------------
 //
-// WHAT THIS PROTECTS. The parts unit tests cannot reach: XHR upload progress, a
-// real page reload between attempts, the React hook's state, and the
-// .env-configured size limit reaching the user. Every test asserts on stored
-// bytes (SHA-256), counted requests, or the exact message shown.
+// WHAT THIS PROTECTS. What unit tests cannot reach: XHR upload progress, real
+// page reloads, the React hook's state, the .env size limit reaching the user,
+// and the buttons' real effects. Assertions are on stored bytes (SHA-256),
+// counted requests, server state, and the exact text shown — never on liveness.
+//
+// Coverage (elements enumerated in page-model.ts):
+//   file input     enabled/disabled per state; picking enables Upload
+//   Upload/Resume  disabled without a file and while busy; label in pause; effect
+//   Pause          enabled only while uploading; effect; inert when disabled
+//   Discard        disabled when nothing to discard; confirms; accept AND cancel
+//   status/progress/error/result/resumed/unfinished — asserted in context
+//
+// Every test runs on chromium, firefox and webkit, isolated in its own visitor
+// namespace, with console, network, server-log and axe checks from test.ts.
+// UNKNOWNs: none.
 // ---------------------------------------------------------------------------
 
-import { expect, test } from '@playwright/test';
-
 import { E2E_MAX_FILE_BYTES, E2E_PART_BYTES } from '../playwright.config';
-import { FIXTURES, fixturePath, sha256OfFixture } from './fixtures';
+import { FIXTURES, sha256OfFixture } from './fixtures';
+import { COMPLETE_POST, PART_PUT, holdPartsAfter, trackPartsInFlight, uploaderPage } from './page-model';
+import { expect, test } from './test';
 
-const PART_PUT = /\/api\/uploads\/[^/]+\/parts\/\d+$/;
+test.describe('uploading', () => {
+  test('uploads a file and stores byte-identical content', async ({ page }) => {
+    const ui = uploaderPage(page);
+    await ui.open();
 
-test('uploads a file and stores byte-identical content', async ({ page }) => {
-  await page.goto('/');
-  await page.getByTestId('file-input').setInputFiles(fixturePath('small'));
-  await page.getByTestId('start').click();
+    // Idle: nothing to upload, pause or discard.
+    await expect(ui.fileInput).toBeEnabled();
+    await expect(ui.uploadButton).toBeDisabled();
+    await expect(ui.pauseButton).toBeDisabled();
+    await expect(ui.discardButton).toBeDisabled();
+    await expect(ui.status).toContainText('Ready');
 
-  await expect(page.getByTestId('status')).toHaveText('Upload complete', { timeout: 60_000 });
-  await expect(page.getByTestId('sha256')).toHaveText(sha256OfFixture('small'));
-  await expect(page.getByTestId('progress')).toHaveAttribute('value', '100');
+    // A disabled button does nothing, even when clicked programmatically.
+    let requests = 0;
+    page.on('request', (req) => req.url().includes('/api/uploads') && req.method() !== 'GET' && (requests += 1));
+    await ui.pauseButton.dispatchEvent('click');
+    await ui.uploadButton.dispatchEvent('click');
+    expect(requests).toBe(0);
+
+    await ui.pick('small');
+    await expect(ui.uploadButton).toBeEnabled();
+    await ui.uploadButton.click();
+
+    // Busy-state controls are asserted in "locks the controls…", which slows the
+    // upload down enough to observe them; this small file can finish first.
+    await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
+    await expect(ui.sha256).toHaveText(sha256OfFixture('small'));
+    await expect(ui.progress).toHaveAttribute('value', '100');
+    await expect(ui.pauseButton).toBeDisabled();
+    await expect(ui.discardButton).toBeDisabled();
+  });
+
+  test('locks the controls while an upload is in progress', async ({ page }) => {
+    const ui = uploaderPage(page);
+    const parts = await holdPartsAfter(page, 0);
+    await ui.open();
+    await ui.pick('retried');
+    await ui.uploadButton.click();
+
+    await expect(ui.status).toContainText('Uploading');
+    await expect(ui.fileInput).toBeDisabled();
+    await expect(ui.uploadButton).toBeDisabled();
+    await expect(ui.pauseButton).toBeEnabled();
+    await expect(ui.discardButton).toBeEnabled();
+
+    await parts.release();
+    await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
+    await expect(ui.fileInput).toBeEnabled();
+  });
+
+  test('resumes after a pause and a page reload, sending only the missing parts', async ({ page }) => {
+    const ui = uploaderPage(page);
+    const totalParts = Math.ceil(FIXTURES.resumable.size / E2E_PART_BYTES);
+    const parts = await holdPartsAfter(page, 3);
+    await ui.open();
+    await ui.pick('resumable');
+    await ui.uploadButton.click();
+    await expect(ui.bytes).toContainText(`part 3/${totalParts}`);
+    await ui.pauseButton.click();
+    await expect(ui.status).toContainText('Paused');
+    await expect(ui.uploadButton).toHaveText('Resume');
+
+    // Exactly the three parts let through reached the server: the held ones
+    // were aborted by the pause before they were sent.
+    const held = (await ui.uploadsOnServer()).find((u) => u.fileName === FIXTURES.resumable.name);
+    expect(held?.receivedBytes).toBe(3 * E2E_PART_BYTES);
+    const missingParts = totalParts - 3;
+
+    await parts.release();
+    await page.reload();
+    await expect(ui.unfinished).toContainText(FIXTURES.resumable.name);
+
+    const sentAfterReload: string[] = [];
+    page.on('request', (req) => req.method() === 'PUT' && PART_PUT.test(req.url()) && sentAfterReload.push(req.url()));
+    await ui.pick('resumable');
+    await ui.uploadButton.click();
+    await expect(ui.resumed).toBeVisible();
+    await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
+
+    expect(sentAfterReload).toHaveLength(missingParts);
+    expect(new Set(sentAfterReload).size).toBe(missingParts);
+    await expect(ui.sha256).toHaveText(sha256OfFixture('resumable'));
+  });
+
+  test('recovers from a 429 and a 503 mid-upload, throttling down, with identical bytes stored', async ({ page }) => {
+    const ui = uploaderPage(page);
+    const injected = new Set<string>();
+    await page.route(PART_PUT, async (route) => {
+      const index = route.request().url().split('/').at(-1);
+      if (index === '2' && !injected.has('429')) {
+        injected.add('429');
+        return route.fulfill({ status: 429, headers: { 'retry-after': '1' }, contentType: 'application/json', body: '{"error":{"code":"RATE_LIMITED","message":"Slow down"}}' });
+      }
+      if (index === '5' && !injected.has('503')) {
+        injected.add('503');
+        return route.fulfill({ status: 503, contentType: 'application/json', body: '{}' });
+      }
+      return route.continue().catch(() => undefined);
+    });
+
+    await ui.open();
+    await ui.pick('retried');
+    await ui.uploadButton.click();
+    await expect(ui.bytes).toContainText('throttled by the server', { timeout: 30_000 });
+    await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
+
+    expect([...injected].sort()).toEqual(['429', '503']);
+    await expect(ui.sha256).toHaveText(sha256OfFixture('retried'));
+  });
+
+  test('a failed finish is reported, keeps every part, and succeeds on retry', async ({ page }) => {
+    const ui = uploaderPage(page);
+    let failedOnce = false;
+    await page.route(COMPLETE_POST, async (route) => {
+      if (!failedOnce) {
+        failedOnce = true;
+        return route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":{"code":"INTERNAL","message":"The upload could not be processed."}}' });
+      }
+      return route.continue().catch(() => undefined);
+    });
+
+    await ui.open();
+    await ui.pick('small');
+    await ui.uploadButton.click();
+    await expect(ui.error).toHaveText('The upload could not be processed.', { timeout: 60_000 });
+    await expect(ui.status).toContainText('Upload failed');
+
+    // Retry: every part is already on the server, so not one is sent again.
+    let partsSent = 0;
+    page.on('request', (req) => PART_PUT.test(req.url()) && (partsSent += 1));
+    await ui.uploadButton.click();
+    await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
+    expect(partsSent).toBe(0);
+    await expect(ui.sha256).toHaveText(sha256OfFixture('small'));
+  });
 });
 
-test('resumes after a pause and a page reload, sending only the missing parts', async ({ page }) => {
-  const totalParts = Math.ceil(FIXTURES.resumable.size / E2E_PART_BYTES);
+test.describe('discarding', () => {
+  test('asks for confirmation, and discarding removes everything from the server', async ({ page }) => {
+    const ui = uploaderPage(page);
+    const partsInFlight = trackPartsInFlight(page);
+    const parts = await holdPartsAfter(page, 2);
+    await ui.open();
+    await ui.pick('discarded');
+    await ui.uploadButton.click();
+    await expect(ui.bytes).toContainText('part 2/');
 
-  // Slow each part down so there is time to pause mid-upload. Pausing aborts the
-  // XHRs this handler is still holding, so its later continue() can find the
-  // request already gone ("Route is already handled") — expected, and ignored.
-  // Left unhandled, those rejections disrupted the routed run and stalled it.
-  await page.route(PART_PUT, async (route) => {
-    await new Promise((r) => setTimeout(r, 250));
-    await route.continue().catch(() => undefined);
+    const dialogs: string[] = [];
+    page.once('dialog', async (dialog) => {
+      dialogs.push(dialog.message());
+      await dialog.accept();
+    });
+    await ui.discardButton.click();
+    await expect(ui.status).toContainText('Ready');
+    expect(dialogs).toEqual(['Discard this upload? The parts already sent will be deleted from the server.']);
+    await parts.release();
+
+    // Released parts were aborted by the discard; wait for every request to
+    // settle, then ask the server rather than trusting the UI. (A part landing
+    // DURING the delete is covered by the removeTree storage test.)
+    await expect.poll(partsInFlight, { timeout: 15_000 }).toBe(0);
+    expect((await ui.uploadsOnServer()).map((u) => u.fileName)).not.toContain(FIXTURES.discarded.name);
   });
 
-  await page.goto('/');
-  await page.getByTestId('file-input').setInputFiles(fixturePath('resumable'));
-  await page.getByTestId('start').click();
-  await expect(page.getByTestId('bytes')).toContainText(/part ([3-9]|1\d)\//, { timeout: 30_000 });
-  await page.getByTestId('pause').click();
-  await expect(page.getByTestId('status')).toHaveText(/Paused/);
+  test('cancelling the discard confirmation keeps the upload', async ({ page }) => {
+    const ui = uploaderPage(page);
+    const parts = await holdPartsAfter(page, 2);
+    await ui.open();
+    await ui.pick('discarded');
+    await ui.uploadButton.click();
+    await expect(ui.bytes).toContainText('part 2/');
+    await ui.pauseButton.click();
+    await expect(ui.status).toContainText('Paused');
+    await parts.release();
 
-  // What the server actually holds now — some in-flight parts may have landed
-  // after the pause, so the expectation is derived from the server, not guessed.
-  const listed = await (await page.request.get('/api/uploads')).json();
-  const received = listed.uploads[0].receivedBytes as number;
-  expect(received).toBeGreaterThan(0);
-  const missingParts = totalParts - received / E2E_PART_BYTES;
+    page.once('dialog', (dialog) => void dialog.dismiss());
+    await ui.discardButton.click();
 
-  // unrouteAll, because the `behavior` option exists only there: it drops the
-  // delaying handler and ignores errors from the calls it still has in flight.
-  await page.unrouteAll({ behavior: 'ignoreErrors' });
-  await page.reload();
-  await expect(page.getByTestId('unfinished')).toContainText(FIXTURES.resumable.name);
-
-  const sentAfterReload: string[] = [];
-  page.on('request', (req) => {
-    if (req.method() === 'PUT' && PART_PUT.test(req.url())) sentAfterReload.push(req.url());
+    await expect(ui.status).toContainText('Paused');
+    await expect(ui.uploadButton).toHaveText('Resume');
+    const held = (await ui.uploadsOnServer()).find((u) => u.fileName === FIXTURES.discarded.name);
+    expect(held?.receivedBytes).toBe(2 * E2E_PART_BYTES);
   });
-
-  await page.getByTestId('file-input').setInputFiles(fixturePath('resumable'));
-  await page.getByTestId('start').click();
-  await expect(page.getByTestId('resumed')).toBeVisible();
-  await expect(page.getByTestId('status')).toHaveText('Upload complete', { timeout: 60_000 });
-
-  expect(sentAfterReload).toHaveLength(missingParts);
-  expect(new Set(sentAfterReload).size).toBe(missingParts); // none sent twice
-  await expect(page.getByTestId('sha256')).toHaveText(sha256OfFixture('resumable'));
 });
 
-test('recovers from a 429 and a 503 mid-upload, throttling down, with identical bytes stored', async ({ page }) => {
-  // One part is rate-limited (with Retry-After) and another fails with a server
-  // error, once each. The upload must retry both through real XHR, show that it
-  // was throttled, and still store exactly the source bytes.
-  const failed = new Set<string>();
-  let throttledShown = false;
-  await page.route(PART_PUT, async (route) => {
-    const index = route.request().url().split('/').at(-1) as string;
-    if (index === '2' && !failed.has('429')) {
-      failed.add('429');
-      return route.fulfill({ status: 429, headers: { 'retry-after': '1' }, contentType: 'application/json', body: JSON.stringify({ error: { code: 'RATE_LIMITED', message: 'Slow down' } }) });
-    }
-    if (index === '5' && !failed.has('503')) {
-      failed.add('503');
-      return route.fulfill({ status: 503, body: '' });
-    }
-    return route.continue().catch(() => undefined);
+test.describe('refusals', () => {
+  test('a different file with the same name is refused, not merged into the first', async ({ page }) => {
+    const ui = uploaderPage(page);
+    const parts = await holdPartsAfter(page, 2);
+    await ui.open();
+    await ui.pick('clash');
+    await ui.uploadButton.click();
+    await expect(ui.bytes).toContainText('part 2/');
+    await ui.pauseButton.click();
+    await expect(ui.status).toContainText('Paused');
+    await parts.release();
+
+    await ui.pick('clashOther');
+    await ui.uploadButton.click();
+    await expect(ui.error).toContainText('already uses this name');
+    await expect(ui.status).toContainText('Upload failed');
+
+    // The first file is untouched and still resumes to its own exact bytes.
+    await ui.pick('clash');
+    await ui.uploadButton.click();
+    await expect(ui.resumed).toBeVisible();
+    await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
+    await expect(ui.sha256).toHaveText(sha256OfFixture('clash'));
   });
 
-  await page.goto('/');
-  await page.getByTestId('file-input').setInputFiles(fixturePath('retried'));
-  await page.getByTestId('start').click();
-  await expect
-    .poll(async () => {
-      throttledShown ||= ((await page.getByTestId('bytes').textContent().catch(() => '')) ?? '').includes('throttled');
-      return page.getByTestId('status').textContent();
-    }, { timeout: 60_000, intervals: [50] })
-    .toBe('Upload complete');
+  test('refuses a file over MULTIPART_UPLOAD_MAX_FILE_BYTES without sending any part', async ({ page }) => {
+    const ui = uploaderPage(page);
+    let partRequests = 0;
+    page.on('request', (req) => PART_PUT.test(req.url()) && (partRequests += 1));
 
-  expect([...failed].sort()).toEqual(['429', '503']); // both failures were really injected
-  expect(throttledShown).toBe(true);
-  await expect(page.getByTestId('sha256')).toHaveText(sha256OfFixture('retried'));
-});
+    await ui.open();
+    await expect(ui.maxSize).toContainText('40 MB');
+    await ui.pick('tooBig');
+    await ui.uploadButton.click();
 
-test('discard during an upload removes everything from the server', async ({ page }) => {
-  // Count part requests still open, from the browser's own network events, so
-  // the test waits for the real condition instead of a fixed sleep.
-  let partsInFlight = 0;
-  page.on('request', (req) => PART_PUT.test(req.url()) && (partsInFlight += 1));
-  const settle = (req: { url(): string }) => PART_PUT.test(req.url()) && (partsInFlight -= 1);
-  page.on('requestfinished', settle);
-  page.on('requestfailed', settle);
-
-  await page.route(PART_PUT, async (route) => {
-    await new Promise((r) => setTimeout(r, 150));
-    await route.continue().catch(() => undefined);
+    await expect(ui.error).toContainText('maximum upload size');
+    await expect(ui.error).toContainText(String(E2E_MAX_FILE_BYTES));
+    await expect(ui.status).toContainText('Upload failed');
+    expect(partRequests).toBe(0);
   });
-  await page.goto('/');
-  await page.getByTestId('file-input').setInputFiles(fixturePath('discarded'));
-  await page.getByTestId('start').click();
-  await expect(page.getByTestId('bytes')).toContainText(/part [2-9]\//, { timeout: 30_000 });
-
-  await page.getByTestId('discard').click();
-  await expect(page.getByTestId('status')).toHaveText('Ready');
-  await page.unrouteAll({ behavior: 'ignoreErrors' });
-
-  // Parts already in flight may land after the DELETE. Wait until every part
-  // request has actually finished or failed, then ask the server directly rather
-  // than trusting the UI.
-  await expect.poll(() => partsInFlight, { timeout: 15_000 }).toBe(0);
-  const listed = await (await page.request.get('/api/uploads')).json();
-  expect(listed.uploads.map((u: { fileName: string }) => u.fileName)).not.toContain(FIXTURES.discarded.name);
-});
-
-test('a different file with the same name is refused, not merged into the first', async ({ page }) => {
-  // Start one report.pdf and pause it; then pick a DIFFERENT report.pdf. The
-  // server must refuse with 409 rather than resume onto the first file's parts.
-  await page.route(PART_PUT, async (route) => {
-    await new Promise((r) => setTimeout(r, 150));
-    await route.continue().catch(() => undefined);
-  });
-  await page.goto('/');
-  await page.getByTestId('file-input').setInputFiles(fixturePath('clash'));
-  await page.getByTestId('start').click();
-  await expect(page.getByTestId('bytes')).toContainText(/part [2-9]\//, { timeout: 30_000 });
-  await page.getByTestId('pause').click();
-  await expect(page.getByTestId('status')).toHaveText(/Paused/);
-  await page.unrouteAll({ behavior: 'ignoreErrors' });
-
-  await page.getByTestId('file-input').setInputFiles(fixturePath('clashOther'));
-  await page.getByTestId('start').click();
-  await expect(page.getByTestId('error')).toContainText('already uses this name');
-  await expect(page.getByTestId('status')).toHaveText('Upload failed');
-
-  // The first file is untouched and still resumable to its own exact bytes.
-  await page.getByTestId('file-input').setInputFiles(fixturePath('clash'));
-  await page.getByTestId('start').click();
-  await expect(page.getByTestId('resumed')).toBeVisible();
-  await expect(page.getByTestId('status')).toHaveText('Upload complete', { timeout: 60_000 });
-  await expect(page.getByTestId('sha256')).toHaveText(sha256OfFixture('clash'));
-});
-
-test('refuses a file over MULTIPART_UPLOAD_MAX_FILE_BYTES without sending any part', async ({ page }) => {
-  let partRequests = 0;
-  page.on('request', (req) => {
-    if (PART_PUT.test(req.url())) partRequests += 1;
-  });
-
-  await page.goto('/');
-  await expect(page.getByTestId('max-size')).toContainText('40 MB');
-  await page.getByTestId('file-input').setInputFiles(fixturePath('tooBig'));
-  await page.getByTestId('start').click();
-
-  // By test id, not role: Next.js's own route announcer also has role="alert".
-  const error = page.getByTestId('error');
-  await expect(error).toHaveAttribute('role', 'alert');
-  await expect(error).toContainText('maximum upload size');
-  await expect(error).toContainText(String(E2E_MAX_FILE_BYTES));
-  await expect(page.getByTestId('status')).toHaveText('Upload failed');
-  expect(partRequests).toBe(0);
 });

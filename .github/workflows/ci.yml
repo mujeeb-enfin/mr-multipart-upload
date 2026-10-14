@@ -54,10 +54,15 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
-      - run: npx playwright install --with-deps chromium
+      # All three engines: CODER.md requires specs to pass on each, and WebKit is
+      # where a real silent-corruption bug was found.
+      - run: npx playwright install --with-deps chromium firefox webkit
         working-directory: apps/demo
       - run: npm run demo:e2e
-      - if: failure()
+      # Always, not only on failure: each test writes an error report
+      # (console, network, server-log and accessibility findings), and a suite
+      # going green while getting noisier is only visible in those.
+      - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: playwright-results

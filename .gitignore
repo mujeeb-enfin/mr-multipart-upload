@@ -15,6 +15,7 @@ coverage/
 /apps/demo/test-results/
 /apps/demo/playwright-report/
 /apps/demo/e2e/.fixtures/
+/apps/demo/e2e/.server-log/
 
 .env
 .env.local
