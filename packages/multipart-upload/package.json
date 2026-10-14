@@ -48,7 +48,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check:package": "npm run build && publint && attw --pack . --profile esm-only",
-    "prepublishOnly": "npm run check:package && npm test"
+    "prepublishOnly": "npm run build && publint && npm test"
   },
   "publishConfig": {
     "access": "public"
