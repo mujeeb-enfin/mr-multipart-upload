@@ -107,6 +107,14 @@ test('recovers from a 429 and a 503 mid-upload, throttling down, with identical 
 });
 
 test('discard during an upload removes everything from the server', async ({ page }) => {
+  // Count part requests still open, from the browser's own network events, so
+  // the test waits for the real condition instead of a fixed sleep.
+  let partsInFlight = 0;
+  page.on('request', (req) => PART_PUT.test(req.url()) && (partsInFlight += 1));
+  const settle = (req: { url(): string }) => PART_PUT.test(req.url()) && (partsInFlight -= 1);
+  page.on('requestfinished', settle);
+  page.on('requestfailed', settle);
+
   await page.route(PART_PUT, async (route) => {
     await new Promise((r) => setTimeout(r, 150));
     await route.continue().catch(() => undefined);
@@ -120,9 +128,10 @@ test('discard during an upload removes everything from the server', async ({ pag
   await expect(page.getByTestId('status')).toHaveText('Ready');
   await page.unrouteAll({ behavior: 'ignoreErrors' });
 
-  // Parts already in flight may land after the DELETE; give them time, then ask
-  // the server directly rather than trusting the UI.
-  await page.waitForTimeout(500);
+  // Parts already in flight may land after the DELETE. Wait until every part
+  // request has actually finished or failed, then ask the server directly rather
+  // than trusting the UI.
+  await expect.poll(() => partsInFlight, { timeout: 15_000 }).toBe(0);
   const listed = await (await page.request.get('/api/uploads')).json();
   expect(listed.uploads.map((u: { fileName: string }) => u.fileName)).not.toContain(FIXTURES.discarded.name);
 });
