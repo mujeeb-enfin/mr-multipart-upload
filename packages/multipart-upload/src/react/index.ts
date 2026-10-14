@@ -1,4 +1,4 @@
-// Public React API — `multipart-upload/react`. Built with a 'use client' banner.
+// Public React API — `mr-multipart-upload/react`. Built with a 'use client' banner.
 
 export { useMultipartUpload } from './use-multipart-upload.js';
 export type { UseMultipartUpload, UseMultipartUploadOptions, UploadStatus } from './use-multipart-upload.js';

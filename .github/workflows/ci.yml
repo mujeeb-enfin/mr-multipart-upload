@@ -29,7 +29,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
-      - run: npm run typecheck --workspace multipart-upload
+      - run: npm run typecheck --workspace mr-multipart-upload
       - run: npm test
 
   package:

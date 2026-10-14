@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 
-import { useMultipartUpload } from 'multipart-upload/react';
+import { useMultipartUpload } from 'mr-multipart-upload/react';
 
 import { ensureVisitorId } from './visitor';
 

@@ -1,7 +1,7 @@
 {
   "name": "demo",
   "private": true,
-  "description": "Next.js demo app for the multipart-upload package.",
+  "description": "Next.js demo app for the mr-multipart-upload package.",
   "type": "module",
   "scripts": {
     "dev": "next dev --port 3000",
@@ -11,7 +11,7 @@
     "e2e": "next build && playwright test"
   },
   "dependencies": {
-    "multipart-upload": "0.1.0",
+    "mr-multipart-upload": "0.1.0",
     "next": "16.4.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"

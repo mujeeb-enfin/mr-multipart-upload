@@ -1,5 +1,5 @@
 {
-  "name": "multipart-upload",
+  "name": "mr-multipart-upload",
   "version": "0.1.0",
   "description": "Resumable multipart file uploads for Next.js — server route handlers, browser client and React hook. No database: the filesystem is the state.",
   "keywords": [
@@ -46,7 +46,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check:package": "npm run build && publint && attw --pack . --profile esm-only"
+    "check:package": "npm run build && publint && attw --pack . --profile esm-only",
+    "prepublishOnly": "npm run check:package && npm test"
   },
   "peerDependencies": {
     "react": ">=18.2.0"

@@ -1,11 +1,11 @@
-# multipart-upload
+# mr-multipart-upload
 
 Resumable multipart file uploads for **Next.js** — server route handlers, a browser client and a React hook, in TypeScript. Interrupted uploads resume by sending only the parts the server is missing. No database required.
 
 **Documentation:** [`packages/multipart-upload/README.md`](packages/multipart-upload/README.md)
 
 ```bash
-npm install multipart-upload
+npm install mr-multipart-upload
 ```
 
 ## Repository layout

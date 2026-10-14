@@ -8,6 +8,8 @@
 // exercised directly — the same objects Next.js passes them.
 // ---------------------------------------------------------------------------
 
+import { readdir } from 'node:fs/promises';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createUploadRoutes, type UploadRoutes, type UploadRoutesOptions } from '../src/server/routes.js';
@@ -248,5 +250,51 @@ describe('auth and routing', () => {
     expect(res.status).toBe(500);
     expect(JSON.stringify(await res.json())).not.toContain('secret database detail');
     expect(onError).toHaveBeenCalledOnce();
+  });
+});
+
+describe('parameters first, .env as the fallback', () => {
+  // Protects the configuration contract: an app that passes settings to
+  // createUploadRoutes() gets exactly those, whatever .env says. The .env
+  // values are set to something different for every setting, so a parameter
+  // that is silently ignored shows up as the .env value.
+  it('every parameter wins over its .env variable, and storage lands in the parameter dir', async () => {
+    const { dir: envDir, cleanup: cleanupEnvDir } = await tempRoot();
+    try {
+      process.env.MULTIPART_UPLOAD_MAX_FILE_BYTES = String(100 * MIB);
+      process.env.MULTIPART_UPLOAD_PART_BYTES = String(MIB);
+      process.env.MULTIPART_UPLOAD_DIR = envDir;
+      process.env.MULTIPART_UPLOAD_PART_TTL_HOURS = '1';
+      process.env.MULTIPART_UPLOAD_INSTANCE_ID = 'from-env';
+
+      const r = routes({ maxFileBytes: 3 * MIB, partBytes: 2 * MIB, partTtlMs: 5_000, instanceId: 'from-param' });
+      expect(r.uploader.config()).toMatchObject({
+        maxFileBytes: 3 * MIB,
+        partBytes: 2 * MIB,
+        dir: root,
+        partTtlMs: 5_000,
+        instanceId: 'from-param',
+      });
+
+      // The limit in force is the parameter's: .env would have accepted 4 MiB.
+      const tooBig = await r.POST(beginRequest({ fileName: 'big.bin', totalBytes: 4 * MIB, fingerprint: 'fp' }));
+      expect(tooBig.status).toBe(413);
+      expect(await tooBig.json()).toMatchObject({ error: { code: 'FILE_TOO_LARGE', details: { maxFileBytes: 3 * MIB } } });
+
+      // The part size in force is the parameter's: 3 MiB in 2 MiB parts is 2 parts (in 1 MiB parts, 3).
+      const begun = await r.POST(beginRequest({ fileName: 'ok.bin', totalBytes: 3 * MIB, fingerprint: 'fp' }));
+      expect(await begun.json()).toMatchObject({ partBytes: 2 * MIB, partCount: 2, maxFileBytes: 3 * MIB });
+
+      // Written under the parameter dir; the .env dir is untouched.
+      expect(await readdir(root)).toContain('.parts');
+      expect(await readdir(envDir)).toEqual([]);
+    } finally {
+      await cleanupEnvDir();
+    }
+  });
+
+  it('uses .env when the parameter is left out', async () => {
+    process.env.MULTIPART_UPLOAD_MAX_FILE_BYTES = String(7 * MIB);
+    expect(routes().uploader.config().maxFileBytes).toBe(7 * MIB);
   });
 });

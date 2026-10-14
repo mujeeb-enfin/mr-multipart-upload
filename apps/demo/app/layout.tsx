@@ -4,7 +4,7 @@ import type { ReactNode } from 'react';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'multipart-upload demo',
+  title: 'mr-multipart-upload demo',
   description: 'Resumable multipart uploads for Next.js',
 };
 

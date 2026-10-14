@@ -1,4 +1,4 @@
-# multipart-upload
+# mr-multipart-upload
 
 Resumable multipart file uploads for **Next.js** — App Router route handlers, a browser client and a React hook, in TypeScript.
 
@@ -8,11 +8,11 @@ Large files are sent in parts. If the connection drops, the tab closes or the se
 - **Nothing random.** Every name is derived from the user, the file name, the part number or the file's hash, so a resume needs no token stored anywhere.
 - **Byte-exact.** The stored file is hashed as it is written, and its size must equal the declared size or nothing is stored.
 - **Isolated per user.** Two users uploading `photo.jpg` never share anything.
-- **Configured from `.env`**, including the maximum upload size.
+- **Configured with parameters**, including the maximum upload size and storage folder — with `.env` as the fallback.
 - **Zero runtime dependencies.**
 
 ```bash
-npm install multipart-upload
+npm install mr-multipart-upload
 ```
 
 Requires Node.js 20.9 or later and the Next.js App Router. The package is ESM-only.
@@ -25,13 +25,19 @@ Requires Node.js 20.9 or later and the Next.js App Router. The package is ESM-on
 
 ```ts
 // app/api/uploads/[[...path]]/route.ts
-import { createUploadRoutes } from 'multipart-upload/server';
+import { createUploadRoutes } from 'mr-multipart-upload/server';
 import { auth } from '@/auth'; // your authentication
 
 export const runtime = 'nodejs';        // the filesystem needs the Node.js runtime
 export const dynamic = 'force-dynamic'; // uploads must never be cached
 
 export const { GET, POST, PUT, DELETE } = createUploadRoutes({
+  // Settings — every one is optional. Left out, each falls back to its .env
+  // variable, then to the default (see Configuration).
+  dir: '/var/data/uploads',          // storage folder
+  maxFileBytes: 500 * 1024 * 1024,   // largest file accepted
+  partBytes: 2 * 1024 * 1024,        // bytes per part, 1–8 MiB
+
   // Who is uploading. Return null to refuse with 401.
   authorize: async () => {
     const session = await auth();
@@ -58,7 +64,7 @@ The folder name `[[...path]]` matters: it is an optional catch-all, so this sing
 
 ```tsx
 'use client';
-import { useMultipartUpload } from 'multipart-upload/react';
+import { useMultipartUpload } from 'mr-multipart-upload/react';
 
 export function FileUpload() {
   const upload = useMultipartUpload({ endpoint: '/api/uploads' });
@@ -77,13 +83,38 @@ export function FileUpload() {
 }
 ```
 
-That is the whole integration. A complete working app is in [`apps/demo`](../../apps/demo).
+That is the whole integration. A complete working Next.js app using it is in the `apps/demo` folder of the source repository.
 
 ---
 
-## Configuration (`.env`)
+## Configuration
 
-Every variable is optional. To change one, add it to your app's `.env.local` (or `.env`). A ready-to-paste starting point — these values are the defaults:
+Pass settings as parameters to `createUploadRoutes()`. Every one is optional, and each is resolved in this order:
+
+1. **The parameter** you pass in code.
+2. **The `.env` variable**, when the parameter is left out.
+3. **The default**, when neither is set.
+
+| Parameter | `.env` fallback | Default | Meaning |
+|---|---|---|---|
+| `maxFileBytes` | `MULTIPART_UPLOAD_MAX_FILE_BYTES` | `524288000` (500 MiB) | Largest file accepted, in bytes. |
+| `partBytes` | `MULTIPART_UPLOAD_PART_BYTES` | `2097152` (2 MiB) | Bytes per part, between 1 MiB and 8 MiB. |
+| `dir` | `MULTIPART_UPLOAD_DIR` | `./uploads` | Where parts and finished files are stored. |
+| `partTtlMs` | `MULTIPART_UPLOAD_PART_TTL_HOURS` (in **hours**) | 48 hours | Unfinished uploads untouched this long are removed. |
+| `instanceId` | `MULTIPART_UPLOAD_INSTANCE_ID` | `single` | A distinct value per server, if you run more than one. |
+
+```ts
+createUploadRoutes({
+  authorize,
+  dir: '/var/data/uploads',
+  maxFileBytes: 2 * 1024 * 1024 * 1024, // 2 GiB
+  partTtlMs: 24 * 60 * 60 * 1000,       // 24 hours
+});
+```
+
+### `.env` fallback
+
+Use `.env` when the value should differ per environment without a code change — or skip it entirely and pass parameters. Add to your app's `.env.local` (or `.env`). These values are the defaults:
 
 ```bash
 # .env.local
@@ -94,26 +125,17 @@ MULTIPART_UPLOAD_PART_TTL_HOURS=48           # unfinished uploads are removed af
 MULTIPART_UPLOAD_INSTANCE_ID=                # set per server if you run more than one
 ```
 
-Remember to add `uploads/` (or your `MULTIPART_UPLOAD_DIR`) to `.gitignore`.
+Remember to add `uploads/` (or your `dir`) to `.gitignore`.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `MULTIPART_UPLOAD_MAX_FILE_BYTES` | `524288000` (500 MiB) | Largest file accepted, in bytes. |
-| `MULTIPART_UPLOAD_PART_BYTES` | `2097152` (2 MiB) | Bytes per part, between 1 MiB and 8 MiB. |
-| `MULTIPART_UPLOAD_DIR` | `./uploads` | Where parts and finished files are stored. |
-| `MULTIPART_UPLOAD_PART_TTL_HOURS` | `48` | Unfinished uploads untouched this long are removed. |
-| `MULTIPART_UPLOAD_INSTANCE_ID` | `single` | A distinct value per server, if you run more than one. |
-
-- Values are read **on every request**, so a changed value takes effect without code changes.
-- Invalid values are **refused, never silently corrected**: `MULTIPART_UPLOAD_MAX_FILE_BYTES=10MB` fails with an error naming the variable. Use whole numbers of bytes.
+- `.env` values are read **on every request**, so a changed value takes effect without code changes.
+- Invalid values are **refused, never silently corrected** — a parameter such as `maxFileBytes: -1`, or `MULTIPART_UPLOAD_MAX_FILE_BYTES=10MB`, fails with an error naming the setting. Use whole numbers of bytes.
 - The browser learns the limit from the server, so it is configured in one place only. An oversized file is refused before any of it is sent.
-- Each setting can be overridden in code: `createUploadRoutes({ maxFileBytes: 50 * 1024 * 1024 })`.
 
 **Reverse proxies:** each part is one request body. Allow at least the part size plus some headroom — with nginx, `client_max_body_size 10m;` covers the 8 MiB maximum.
 
 ---
 
-## Server API — `multipart-upload/server`
+## Server API — `mr-multipart-upload/server`
 
 ### `createUploadRoutes(options)`
 
@@ -133,13 +155,13 @@ Returns `{ GET, POST, PUT, DELETE, uploader }`. Export the four handlers from yo
 | `lockStaleMs` | A finishing lock older than this is treated as abandoned. Default 15 minutes. |
 | `onError(error, request)` | Called for unexpected (500) errors. Default: `console.error`. |
 | `storage` | A custom storage backend (see below). |
-| `maxFileBytes`, `partBytes`, `dir`, `partTtlMs`, `instanceId` | Override the matching `.env` values. |
+| `maxFileBytes`, `partBytes`, `dir`, `partTtlMs`, `instanceId` | The settings — see [Configuration](#configuration). Each falls back to its `.env` variable, then the default. |
 
 The `file` passed to `onComplete`:
 
 ```ts
 {
-  key: string;                 // storage key, relative to MULTIPART_UPLOAD_DIR
+  key: string;                 // storage key, relative to the storage folder (`dir`)
   localPath: string | undefined; // absolute path on disk (always set with the built-in filesystem storage)
   size: number;
   sha256: string;              // lowercase hex
@@ -158,7 +180,7 @@ There are no background timers. Expired uploads are removed when a new upload be
 
 ```ts
 // lib/uploads.ts
-import { createUploadRoutes } from 'multipart-upload/server';
+import { createUploadRoutes } from 'mr-multipart-upload/server';
 export const uploads = createUploadRoutes({ authorize, onComplete });
 ```
 
@@ -183,7 +205,7 @@ export async function POST() {
 
 ## Client API
 
-### `useMultipartUpload(options)` — `multipart-upload/react`
+### `useMultipartUpload(options)` — `mr-multipart-upload/react`
 
 | Returns | |
 |---|---|
@@ -200,7 +222,7 @@ export async function POST() {
 
 Unmounting the component pauses the upload; it never discards it.
 
-### `startUpload(options)` — `multipart-upload/client`
+### `startUpload(options)` — `mr-multipart-upload/client`
 
 The framework-free engine behind the hook. Returns `{ promise, pause, discard, uploadId }`.
 

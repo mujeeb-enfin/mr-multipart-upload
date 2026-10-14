@@ -1,6 +1,9 @@
 // ---------------------------------------------------------------------------
-// config.ts — configuration from .env, overridable in code
+// config.ts — configuration: parameters first, .env as the fallback
 // ---------------------------------------------------------------------------
+//
+// Precedence for every setting: the parameter passed in code, then the .env
+// variable, then the default below.
 //
 //   MULTIPART_UPLOAD_MAX_FILE_BYTES   largest file accepted        default 500 MiB
 //   MULTIPART_UPLOAD_PART_BYTES       bytes per part, 1–8 MiB      default 2 MiB
@@ -41,12 +44,21 @@ export const ENV = {
   instanceId: 'MULTIPART_UPLOAD_INSTANCE_ID',
 } as const;
 
-/** Values an application may set in code; each wins over its `.env` variable. */
+/**
+ * Settings passed as parameters to `createUploadRoutes()` / `createUploader()`.
+ * Each one is used first; when it is left out, the `.env` variable named below
+ * is used, and when that is unset too, the built-in default.
+ */
 export interface ConfigOverrides {
+  /** Largest file accepted, in bytes. Falls back to MULTIPART_UPLOAD_MAX_FILE_BYTES, then 500 MiB. */
   maxFileBytes?: number;
+  /** Bytes per part, 1–8 MiB. Falls back to MULTIPART_UPLOAD_PART_BYTES, then 2 MiB. */
   partBytes?: number;
+  /** Storage folder for parts and finished files. Falls back to MULTIPART_UPLOAD_DIR, then ./uploads. */
   dir?: string;
+  /** Unfinished uploads untouched this long are removed, in ms. Falls back to MULTIPART_UPLOAD_PART_TTL_HOURS, then 48 h. */
   partTtlMs?: number;
+  /** A distinct value per server when running more than one. Falls back to MULTIPART_UPLOAD_INSTANCE_ID, then "single". */
   instanceId?: string;
 }
 
