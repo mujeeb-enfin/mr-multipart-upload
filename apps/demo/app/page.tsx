@@ -12,8 +12,9 @@ export default function Page() {
       </header>
       <Uploader />
       <p className="footnote">
-        This demo accepts anonymous uploads. A real application passes an <code>authorize</code>{' '}
-        function to <code>createUploadRoutes</code> so each user&apos;s uploads are isolated.
+        This demo has no accounts, so each browser is identified by a visitor cookie and sees only
+        its own uploads. A real application returns its signed-in user&apos;s id from the{' '}
+        <code>authorize</code> function passed to <code>createUploadRoutes</code>.
       </p>
     </main>
   );

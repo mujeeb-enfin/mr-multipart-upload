@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { useMultipartUpload } from 'multipart-upload/react';
 
+import { ensureVisitorId } from './visitor';
+
 interface Unfinished {
   uploadId: string;
   fileName: string;
@@ -47,8 +49,21 @@ export function Uploader() {
   }, []);
 
   useEffect(() => {
+    // The visitor id must exist before the first request: the route's
+    // `authorize` refuses requests without one.
+    ensureVisitorId();
     void refresh();
   }, [refresh]);
+
+  const confirmAndDiscard = useCallback(async () => {
+    // Destructive: it deletes every part already on the server.
+    const confirmed = window.confirm(
+      'Discard this upload? The parts already sent will be deleted from the server.',
+    );
+    if (!confirmed) return;
+    await upload.discard();
+    await refresh();
+  }, [upload, refresh]);
 
   useEffect(() => {
     if (upload.status === 'done' || upload.status === 'paused' || upload.status === 'error') void refresh();
@@ -92,13 +107,13 @@ export function Uploader() {
           data-testid="discard"
           className="danger"
           disabled={upload.status === 'idle' || upload.status === 'done' || upload.status === 'assembling'}
-          onClick={() => void upload.discard().then(refresh)}
+          onClick={() => void confirmAndDiscard()}
         >
           Discard
         </button>
       </div>
 
-      <div className="status" aria-live="polite">
+      <div className="status" role="status" aria-live="polite" aria-label="Upload status">
         <div className="status-line">
           <strong data-testid="status">{STATUS_LABEL[upload.status]}</strong>
           {upload.progress && (
