@@ -123,6 +123,29 @@ describe('FsStorage.assemble', () => {
   });
 });
 
+describe('FsStorage.removeTree', () => {
+  it('survives part files being created inside the tree while it is removed', async () => {
+    // A discard races with parts still in flight. On Windows the recursive
+    // rmdir saw a file land after it emptied the directory and failed with
+    // ENOTEMPTY, which surfaced as a 500 on DELETE (seen in the e2e suite).
+    // MUTATION: drop maxRetries from removeTree -> rejects with ENOTEMPTY on
+    // Windows (2 of 3 runs measured; it is a race, so not every run). Linux
+    // unlinks differently and may not reproduce it at all.
+    const storage = new FsStorage(root);
+    const before = Array.from({ length: 200 }, (_, i) => `s/${String(i).padStart(6, '0')}.before.part`);
+    await Promise.all(before.map((key) => storage.createExclusive(key, patternBytes(256, 1))));
+
+    for (let round = 0; round < 20; round += 1) {
+      const writers = Array.from({ length: 50 }, (_, i) =>
+        storage.createExclusive(`s/${round}-${i}.late.part`, 'x').catch(() => undefined),
+      );
+      await storage.removeTree('s');
+      await Promise.all(writers);
+    }
+    for (const key of before) expect(await storage.stat(key), key).toBeNull();
+  });
+});
+
 describe('FsStorage.promote', () => {
   it('REPLACES an existing destination rather than throwing — dedupe must not rely on it', async () => {
     // Pins the behaviour a source comment once got wrong. If rename ever starts

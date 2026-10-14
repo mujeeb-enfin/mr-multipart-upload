@@ -109,7 +109,11 @@ export class FsStorage implements StorageAdapter {
   }
 
   async removeTree(dirKey: string): Promise<void> {
-    await rm(this.path(dirKey), { recursive: true, force: true });
+    // A part still in flight can land in the tree after rm has emptied a
+    // directory but before it removes it; rmdir then fails ENOTEMPTY (Windows
+    // also reports EBUSY/EPERM for a file being written). Node's own retry
+    // removes the late arrival and tries again.
+    await rm(this.path(dirKey), { recursive: true, force: true, maxRetries: 10, retryDelay: 10 });
   }
 
   async readHead(key: string, byteCount: number): Promise<Uint8Array> {
