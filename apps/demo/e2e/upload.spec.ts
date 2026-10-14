@@ -51,7 +51,9 @@ test('resumes after a pause and a page reload, sending only the missing parts', 
   expect(received).toBeGreaterThan(0);
   const missingParts = totalParts - received / E2E_PART_BYTES;
 
-  await page.unroute(PART_PUT, { behavior: 'ignoreErrors' });
+  // unrouteAll, because the `behavior` option exists only there: it drops the
+  // delaying handler and ignores errors from the calls it still has in flight.
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
   await page.reload();
   await expect(page.getByTestId('unfinished')).toContainText(FIXTURES.resumable.name);
 
