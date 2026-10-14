@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { partCountFor } from '../src/core/arithmetic.js';
 import { UploadError } from '../src/core/errors.js';
 import { lockKey, partKey, sessionKey } from '../src/core/layout.js';
-import { namespaceKeyFor } from '../src/server/namespace.js';
+import { namespaceKeyFor, partTagFor } from '../src/server/namespace.js';
 import { createUploader, type Uploader, type UploaderOptions } from '../src/server/uploader.js';
 import { MIB, clearEnv, partOf, patternBytes, sha256, tempRoot } from './helpers.js';
 
@@ -168,7 +168,7 @@ describe('parts', () => {
     // Each attempt either succeeded or was told to retry — never anything else.
     expect(outcomes.every((o) => o === 'resolved' || o === 'PART_IN_FLIGHT')).toBe(true);
     expect(outcomes).toContain('resolved');
-    const stored = await readFile(join(root, partKey(namespaceKeyFor(ALICE.namespace), 'f-bin', 2)));
+    const stored = await readFile(join(root, partKey(namespaceKeyFor(ALICE.namespace), 'f-bin', 2, partTagFor(fp))));
     expect(sha256(new Uint8Array(stored))).toBe(sha256(partOf(bytes, 2, MIB)));
   });
 
@@ -179,7 +179,7 @@ describe('parts', () => {
     await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp });
     await sendParts(up, ALICE, 'f-bin', bytes, 'f.bin', [1, 2, 3, 4]);
     // Simulate a write that died half-way.
-    await writeFile(join(root, partKey(namespaceKeyFor(ALICE.namespace), 'f-bin', 3)), partOf(bytes, 3, MIB).subarray(0, 1000));
+    await writeFile(join(root, partKey(namespaceKeyFor(ALICE.namespace), 'f-bin', 3, partTagFor(fp))), partOf(bytes, 3, MIB).subarray(0, 1000));
     expect((await up.status(ALICE, 'f-bin')).missingParts).toEqual([3]);
     expect(await codeOf(up.complete(ALICE, 'f-bin'))).toBe('INCOMPLETE');
     await sendParts(up, ALICE, 'f-bin', bytes, 'f.bin', [3]);

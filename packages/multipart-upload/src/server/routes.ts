@@ -83,7 +83,16 @@ async function readBodyCapped(request: Request, max: number, what: string): Prom
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
-    const { done, value } = await reader.read();
+    let chunk: ReadableStreamReadResult<Uint8Array>;
+    try {
+      chunk = await reader.read();
+    } catch {
+      // The body stream failed: the client disconnected (ECONNRESET) — what a
+      // pause or discard does to in-flight parts. A client event, not a server
+      // fault, so it must not reach onError: every pause used to log an error.
+      throw new UploadError('CLIENT_DISCONNECTED', `${what} was not received in full; the client disconnected.`);
+    }
+    const { done, value } = chunk;
     if (done) break;
     total += value.byteLength;
     if (total > max) {

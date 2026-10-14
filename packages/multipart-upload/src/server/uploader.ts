@@ -16,7 +16,7 @@ import type { StorageAdapter } from '../storage/adapter.js';
 import { FsStorage } from '../storage/fs-storage.js';
 import { completeUpload, DEFAULT_LOCK_STALE_MS, type CompleteHookInput, type CompleteResult } from './complete.js';
 import { type ConfigOverrides, type ResolvedConfig, resolveConfig } from './config.js';
-import { namespaceKeyFor } from './namespace.js';
+import { namespaceKeyFor, partTagFor } from './namespace.js';
 import { listVerifiedParts, readManifest, readSession, findSession, type StoreContext } from './store.js';
 import { sweepStaleUploads, type SweepResult } from './sweep.js';
 
@@ -137,6 +137,9 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       throw new UploadError('INVALID_REQUEST', 'fingerprint must be 1–200 characters of [A-Za-z0-9._:-]');
     }
     const { totalBytes } = input;
+    if (totalBytes === 0) {
+      throw new UploadError('INVALID_REQUEST', `"${input.fileName}" is empty. Empty files cannot be uploaded.`);
+    }
     if (!Number.isSafeInteger(totalBytes) || totalBytes <= 0) {
       throw new UploadError('INVALID_REQUEST', 'totalBytes must be a positive integer');
     }
@@ -234,7 +237,10 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       throw new UploadError('PART_LENGTH_MISMATCH', `Part ${index} must be ${expected} bytes, received ${bytes.byteLength}.`);
     }
 
-    const key = partKey(store.namespaceKey, uploadId, index);
+    // Named with this upload's part tag, so an orphan of another file under the
+    // same name occupies a DIFFERENT key and can never satisfy the
+    // "already present" check below with the wrong bytes.
+    const key = partKey(store.namespaceKey, uploadId, index, partTagFor(manifest.fingerprint));
     let alreadyPresent = false;
 
     // createExclusive is the concurrency control: exactly one writer wins, so

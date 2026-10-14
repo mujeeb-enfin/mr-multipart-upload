@@ -24,9 +24,10 @@
 // ---------------------------------------------------------------------------
 
 import { UploadError } from '../core/errors.js';
-import { FILES_DIR, PARTS_DIR, lockKey, partIndexFromFileName, partKey, sessionKey, stagingKey } from '../core/layout.js';
+import { FILES_DIR, PARTS_DIR, lockKey, parsePartFileName, partKey, sessionKey, stagingKey } from '../core/layout.js';
 import { expectedPartBytes } from '../core/arithmetic.js';
 import type { UploadMetadata } from '../core/session.js';
+import { partTagFor } from './namespace.js';
 import { readManifest, readSession, type StoreContext } from './store.js';
 import type { UploaderOptions } from './uploader.js';
 
@@ -91,18 +92,25 @@ async function acquireLock(store: StoreContext, uploadId: string, staleMs: numbe
   throw new UploadError('COMPLETE_IN_PROGRESS', 'This upload is already being finalised.');
 }
 
-/** Delete parts that are present but the wrong size. Only ever under the lock. */
+/**
+ * Delete parts that do not belong in this assembly: orphans of another file
+ * (a different part tag), indices beyond the part count, and wrong sizes. Only
+ * ever under the lock, when no write for this upload should be in flight.
+ */
 async function pruneParts(store: StoreContext, uploadId: string): Promise<void> {
   const manifest = await readManifest(store, uploadId);
   if (!manifest) return;
-  for (const entry of await store.storage.list(sessionKey(store.namespaceKey, uploadId))) {
-    const index = partIndexFromFileName(entry);
-    if (index === null) continue;
-    const key = partKey(store.namespaceKey, uploadId, index);
-    if (index > manifest.partCount) {
-      await store.storage.remove(key);
+  const tag = partTagFor(manifest.fingerprint);
+  const dir = sessionKey(store.namespaceKey, uploadId);
+  for (const entry of await store.storage.list(dir)) {
+    const parsed = parsePartFileName(entry);
+    if (!parsed) continue;
+    if (parsed.tag !== tag || parsed.index > manifest.partCount) {
+      await store.storage.remove(`${dir}/${entry}`);
       continue;
     }
+    const key = partKey(store.namespaceKey, uploadId, parsed.index, tag);
+    const index = parsed.index;
     const info = await store.storage.stat(key);
     if (!info || info.isDirectory || info.size !== expectedPartBytes(index, manifest.partBytes, manifest.totalBytes)) {
       await store.storage.remove(key);
@@ -157,9 +165,10 @@ export async function completeUpload(
       });
     }
 
+    const tag = partTagFor(manifest.fingerprint);
     if (options.validateHead) {
       const head = await store.storage.readHead(
-        partKey(store.namespaceKey, uploadId, 1),
+        partKey(store.namespaceKey, uploadId, 1, tag),
         options.headBytes ?? DEFAULT_HEAD_BYTES,
       );
       try {
@@ -178,7 +187,7 @@ export async function completeUpload(
     }
 
     const partKeys = Array.from({ length: manifest.partCount }, (_, i) =>
-      partKey(store.namespaceKey, uploadId, i + 1),
+      partKey(store.namespaceKey, uploadId, i + 1, tag),
     );
     stagingExists = true;
     const assembly = await store.storage.assemble(partKeys, staging);

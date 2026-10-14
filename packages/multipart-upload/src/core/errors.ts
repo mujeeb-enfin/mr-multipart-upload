@@ -39,6 +39,11 @@ export type UploadErrorCode =
   | 'INVALID_NAME'
   /** The request is malformed: bad JSON, missing field, bad header. */
   | 'INVALID_REQUEST'
+  /**
+   * The client went away before its request body arrived — normal when a user
+   * pauses or discards. Not a server fault, so never reported through onError.
+   */
+  | 'CLIENT_DISCONNECTED'
   /** `validateHead` refused the file's contents. The parts are kept. */
   | 'REJECTED'
   /** `authorize` returned nothing or threw. */
@@ -66,6 +71,7 @@ const STATUS_FOR_CODE: Record<UploadErrorCode, number> = {
   METADATA_TOO_LARGE: 413,
   INVALID_NAME: 400,
   INVALID_REQUEST: 400,
+  CLIENT_DISCONNECTED: 400,
   REJECTED: 422,
   UNAUTHORIZED: 401,
   NOT_FOUND: 404,

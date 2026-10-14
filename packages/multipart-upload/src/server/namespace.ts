@@ -31,6 +31,15 @@ export const ANONYMOUS_NAMESPACE = '__anonymous__';
 
 const MAX_NAMESPACE_LENGTH = 512;
 
+/**
+ * The tag that binds a part file to the file it belongs to (see layout.ts).
+ * 64 bits of SHA-256 over the fingerprint: derived, so the same file always gets
+ * the same tag and resumes, while a different file never shares one.
+ */
+export function partTagFor(fingerprint: string): string {
+  return createHash('sha256').update(fingerprint, 'utf8').digest('hex').slice(0, 16);
+}
+
 export function namespaceKeyFor(namespace: string): string {
   if (typeof namespace !== 'string' || namespace.length === 0) {
     throw new UploadError('UNAUTHORIZED', 'authorize() must return a non-empty namespace');

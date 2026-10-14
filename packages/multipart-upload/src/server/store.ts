@@ -19,6 +19,7 @@ import { manifestKey, partIndexFromFileName, partKey, sessionKey } from '../core
 import { type UploadManifest, type UploadSession, summariseSession } from '../core/session.js';
 import type { StorageAdapter } from '../storage/adapter.js';
 import type { ResolvedConfig } from './config.js';
+import { partTagFor } from './namespace.js';
 
 /** Everything an operation needs once the caller has been authorised. */
 export interface StoreContext {
@@ -42,11 +43,14 @@ export async function readManifest(ctx: StoreContext, uploadId: string): Promise
  */
 export async function listVerifiedParts(ctx: StoreContext, manifest: UploadManifest): Promise<number[]> {
   const entries = await ctx.storage.list(sessionKey(ctx.namespaceKey, manifest.uploadId));
+  const tag = partTagFor(manifest.fingerprint);
   const verified: number[] = [];
   for (const entry of entries) {
-    const index = partIndexFromFileName(entry);
+    // Only parts carrying THIS upload's tag count. A correctly-sized part of
+    // another file — an orphan — is invisible here (see layout.ts).
+    const index = partIndexFromFileName(entry, tag);
     if (index === null || index > manifest.partCount) continue;
-    const info = await ctx.storage.stat(partKey(ctx.namespaceKey, manifest.uploadId, index));
+    const info = await ctx.storage.stat(partKey(ctx.namespaceKey, manifest.uploadId, index, tag));
     if (info && !info.isDirectory && info.size === expectedPartBytes(index, manifest.partBytes, manifest.totalBytes)) {
       verified.push(index);
     }

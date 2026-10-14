@@ -83,7 +83,18 @@ That is the whole integration. A complete working app is in [`apps/demo`](../../
 
 ## Configuration (`.env`)
 
-Every variable is optional.
+Every variable is optional. To change one, add it to your app's `.env.local` (or `.env`). A ready-to-paste starting point — these values are the defaults:
+
+```bash
+# .env.local
+MULTIPART_UPLOAD_MAX_FILE_BYTES=1073741824   # 1 GiB — largest file accepted
+MULTIPART_UPLOAD_PART_BYTES=2097152          # 2 MiB — between 1048576 and 8388608
+MULTIPART_UPLOAD_DIR=./uploads               # persistent, writable directory
+MULTIPART_UPLOAD_PART_TTL_HOURS=48           # unfinished uploads are removed after this
+MULTIPART_UPLOAD_INSTANCE_ID=                # set per server if you run more than one
+```
+
+Remember to add `uploads/` (or your `MULTIPART_UPLOAD_DIR`) to `.gitignore`.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -211,7 +222,7 @@ The framework-free engine behind the hook. Returns `{ promise, pause, discard, u
 
 ## How resume works
 
-1. The browser sends the file's name, size and a **fingerprint** derived from its size, modification time and name.
+1. The browser sends the file's name, size and a **fingerprint** derived from its size, modification time, name, and a hash of its first and last 64 KB.
 2. The server derives an upload id from the file name (`Holiday Video.mp4` → `holiday-video-mp4`) and looks for an existing upload with that id in the user's namespace.
 3. If one exists **and the fingerprint matches**, the server lists its directory and answers with the part numbers it is missing. If the fingerprint does not match, it is a different file with the same name, and the server refuses with `409 NAME_IN_USE` rather than mixing the two.
 4. The browser sends only the missing parts.
@@ -222,11 +233,18 @@ On disk:
 uploads/
   .parts/<namespace hash>/holiday-video-mp4/
     manifest.json
-    000001.part … 000200.part
+    000001.3f9a1c07b2d4e816.part … 000200.3f9a1c07b2d4e816.part
   files/<namespace hash>/<sha256>.mp4
 ```
 
-A part counts as received only if its size is exactly right, so a part cut off mid-write is re-sent automatically. Parts are created with an exclusive-create flag, so two simultaneous attempts at the same part can never interleave.
+Each part's name carries a **tag derived from the file's fingerprint**, binding it to the file it belongs to. A part only counts as received if it has this upload's tag *and* exactly the right size, so:
+
+- a part cut off mid-write is re-sent automatically;
+- a part left behind by a discarded upload — for example a write that was still in flight when the user discarded — can never be mistaken for part of a later, different file with the same name. It is ignored, and removed when the upload completes.
+
+Parts are created with an exclusive-create flag, so two simultaneous attempts at the same part can never interleave.
+
+**The one remaining blind spot:** two *different* files with the same name, size and modification time whose first and last 64 KB are also identical — differing only in the middle — get the same fingerprint, and the second would resume onto the first's parts. If your users may produce such files, include something that distinguishes them in the file name.
 
 ---
 
@@ -270,6 +288,7 @@ Every error response is `{ "error": { "code", "message", "details"? } }`.
 | `PART_OUT_OF_RANGE` | 400 | A part number outside the upload. |
 | `INVALID_NAME` | 400 | The file name has no Latin letter or digit to build an id from. |
 | `INVALID_REQUEST` | 400 | A malformed request. |
+| `CLIENT_DISCONNECTED` | 400 | The browser went away mid-request — normal on pause or discard. Not reported to `onError`. |
 | `REJECTED` | 422 | `validateHead` refused the file. |
 | `TOO_MANY_PARTS` | 422 | The file needs more than 999,999 parts. |
 | `UNAUTHORIZED` | 401 | `authorize` refused. |

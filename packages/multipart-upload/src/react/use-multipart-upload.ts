@@ -60,9 +60,13 @@ export function useMultipartUpload(options: UseMultipartUploadOptions = {}): Use
   const [error, setError] = useState<UploadClientError | null>(null);
 
   // Latest options without restarting anything when the caller re-renders with
-  // a new object literal.
+  // a new object literal. Synced in an effect, not during render: renders must
+  // stay pure. `start` is only ever called from events after commit, so it
+  // always sees the committed options.
   const optionsRef = useRef(options);
-  optionsRef.current = options;
+  useEffect(() => {
+    optionsRef.current = options;
+  });
 
   const handleRef = useRef<UploadHandle | null>(null);
   const lastFileRef = useRef<{ file: File; metadata?: Record<string, unknown> } | null>(null);

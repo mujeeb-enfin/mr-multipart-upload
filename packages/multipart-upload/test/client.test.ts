@@ -116,6 +116,12 @@ describe('startUpload', () => {
     expect(run.sha256).toBe(sha256(bytes));
     expect(run.rejected429).toBe(1);
     expect(run.phases.has('throttled')).toBe(true);
+    // MUTATION: retry the throttled part in place instead of requeueing it -> it
+    // goes back on the wire while the surviving worker is mid-part: 2 at once.
+    // Measured at the exact moment of the retry, not over a counted window — an
+    // earlier count-based version caught this only when the timing happened to
+    // line up (5/5 in isolation, missed in a full-file run).
+    expect(run.inFlightAtRetry).toBe(1);
     // Parts already running when the 429 arrives are allowed to finish; every part
     // that STARTS after that drain window must run alone.
     expect(run.maxConcurrencyAfterDrain).toBe(1);
@@ -218,6 +224,38 @@ describe('startUpload', () => {
     expect(((await status.json()) as { error: { code: string } }).error.code).toBe('NO_SESSION');
   });
 
+  it('discard while begin is still in flight leaves nothing on the server', async () => {
+    // The server can create the upload before the client learns its id. If the
+    // client aborts begin and forgets it, the "discarded" upload lingers until the
+    // sweep. Begin is slowed so discard() lands while it is in flight.
+    // Behaves like a browser's fetch: if the request's signal aborts before the
+    // response arrives, the promise REJECTS — even though the server already
+    // processed it. The plain in-process dispatch ignores signals, which is why an
+    // earlier version of this test could not tell an abortable begin apart.
+    const slowBegin: typeof fetch = async (input, init) => {
+      if ((init?.method ?? 'GET') === 'POST' && !String(input).includes('/complete')) {
+        const response = await dispatch(input, init); // the server has created it...
+        await tick(50); // ...but the client has not heard back yet
+        if (init?.signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+        return response;
+      }
+      return dispatch(input, init);
+    };
+    const handle = startUpload({ file: fileFrom(patternBytes(3 * MIB), 'early.bin'), headers: auth, fetch: slowBegin, sendPart: fetchPartSender(dispatch) });
+    await tick(10);
+    await handle.discard();
+    await handle.promise.catch(() => undefined);
+
+    const listed = (await (await dispatch('/api/uploads', { headers: auth })).json()) as { uploads: unknown[] };
+    expect(listed.uploads).toEqual([]);
+  });
+
+  it('refuses an empty file with a message that says so', async () => {
+    const err = await startUpload({ file: fileFrom(new Uint8Array(0), 'empty.txt'), headers: auth, fetch: dispatch }).promise.catch((e: unknown) => e);
+    expect((err as UploadClientError).code).toBe('INVALID_REQUEST');
+    expect((err as UploadClientError).message).toMatch(/empty/i);
+  });
+
   it('sends the caller headers so authorize can identify the user', async () => {
     const err = await startUpload({ file: fileFrom(patternBytes(10), 'a.bin'), fetch: dispatch }).promise.catch((e: unknown) => e);
     expect((err as UploadClientError).status).toBe(401);
@@ -235,11 +273,14 @@ async function throttledRun(bytes: Uint8Array<ArrayBuffer>) {
   let maxConcurrencyBefore = 0;
   let maxConcurrencyAfterDrain = 0;
   let rejected429 = 0;
+  let inFlightAtRetry = -1;
   const phases = new Set<string>();
 
   const sender: PartSender = async (req) => {
     started += 1;
     inFlight += 1;
+    // The second call for part 2 is the retry of the throttled part.
+    if (throttledAt >= 0 && req.url.endsWith('/parts/2')) inFlightAtRetry = inFlight;
     if (throttledAt < 0) maxConcurrencyBefore = Math.max(maxConcurrencyBefore, inFlight);
     // `+ 4`: up to four parts (the initial concurrency) were already running.
     else if (started > throttledAt + 4) maxConcurrencyAfterDrain = Math.max(maxConcurrencyAfterDrain, inFlight);
@@ -265,5 +306,5 @@ async function throttledRun(bytes: Uint8Array<ArrayBuffer>) {
     concurrency: 4,
     onProgress: (p) => phases.add(p.phase),
   }).promise;
-  return { sha256: result.sha256, rejected429, phases, maxConcurrencyBefore, maxConcurrencyAfterDrain };
+  return { sha256: result.sha256, rejected429, phases, maxConcurrencyBefore, maxConcurrencyAfterDrain, inFlightAtRetry };
 }

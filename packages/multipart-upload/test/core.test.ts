@@ -19,6 +19,7 @@ import {
   MAX_PART_COUNT,
   PART_NUMBER_WIDTH,
   STAGING_FILE,
+  parsePartFileName,
   partFileName,
   partIndexFromFileName,
   partKey,
@@ -113,29 +114,36 @@ describe('partByteRange', () => {
   });
 });
 
+const TAG = '3f9a1c07b2d4e816';
+const OTHER_TAG = '0123456789abcdef';
+
 describe('part filenames', () => {
-  it('pads to six digits', () => {
+  it('pads to six digits and carries the part tag', () => {
     expect(PART_NUMBER_WIDTH).toBe(6);
-    expect(partFileName(1)).toBe('000001.part');
-    expect(partFileName(MAX_PART_COUNT)).toBe('999999.part');
+    expect(partFileName(1, TAG)).toBe(`000001.${TAG}.part`);
+    expect(partFileName(MAX_PART_COUNT, TAG)).toBe(`999999.${TAG}.part`);
   });
 
   it('sorts lexically in numeric order beyond three digits', () => {
-    // MUTATION: PART_NUMBER_WIDTH = 3 -> '1000.part' sorts before '999.part'.
+    // MUTATION: PART_NUMBER_WIDTH = 3 -> '1000.…' sorts before '999.…'.
     const indices = [1, 2, 9, 10, 99, 100, 999, 1000, 1001, 99999, 100000];
-    expect(indices.map(partFileName).sort()).toEqual(indices.map(partFileName));
+    const names = indices.map((i) => partFileName(i, TAG));
+    expect([...names].sort()).toEqual(names);
   });
 
   it('builds a namespaced key with no random component', () => {
     const ns = 'a'.repeat(32);
-    expect(partKey(ns, 'cafe-mp3', 11)).toBe(`.parts/${ns}/cafe-mp3/000011.part`);
-    expect(partKey(ns, 'cafe-mp3', 11)).toBe(partKey(ns, 'cafe-mp3', 11));
+    expect(partKey(ns, 'cafe-mp3', 11, TAG)).toBe(`.parts/${ns}/cafe-mp3/000011.${TAG}.part`);
+    expect(partKey(ns, 'cafe-mp3', 11, TAG)).toBe(partKey(ns, 'cafe-mp3', 11, TAG));
   });
 
-  it('refuses an out-of-range index rather than emitting a 7-digit name', () => {
-    expect(() => partFileName(0)).toThrow(UploadError);
-    expect(() => partFileName(MAX_PART_COUNT + 1)).toThrow(/out of range/);
-    expect(() => partFileName(1.5)).toThrow(/out of range/);
+  it('refuses an out-of-range index or a malformed tag', () => {
+    expect(() => partFileName(0, TAG)).toThrow(UploadError);
+    expect(() => partFileName(MAX_PART_COUNT + 1, TAG)).toThrow(/out of range/);
+    expect(() => partFileName(1.5, TAG)).toThrow(/out of range/);
+    for (const bad of ['', 'ABCDEF0123456789', '3f9a1c07b2d4e81', '../../../../etc', '3f9a1c07b2d4e816x']) {
+      expect(() => partFileName(1, bad), bad).toThrow(/Part tag/);
+    }
   });
 });
 
@@ -144,16 +152,24 @@ describe('partIndexFromFileName', () => {
     // MUTATION: unanchor the pattern -> the manifest, staging file or lock is
     // counted as a received part and `complete` assembles a hole.
     for (const name of [
-      MANIFEST_FILE, STAGING_FILE, LOCK_FILE, '000011.part.tmp', 'x000011.part',
-      '000011.parts', '00011.part', '0000011.part', '000011.PART', '', '.', '..', '000000.part',
+      MANIFEST_FILE, STAGING_FILE, LOCK_FILE, `000011.${TAG}.part.tmp`, `x000011.${TAG}.part`,
+      `000011.${TAG}.parts`, `00011.${TAG}.part`, `0000011.${TAG}.part`, `000011.${TAG}.PART`,
+      '000011.part', '', '.', '..', `000000.${TAG}.part`,
     ]) {
-      expect(partIndexFromFileName(name), name).toBeNull();
+      expect(partIndexFromFileName(name, TAG), name).toBeNull();
     }
+  });
+
+  it('IGNORES a part belonging to a different file — the orphan case', () => {
+    // MUTATION: drop the tag comparison -> a correctly-sized orphan of another
+    // file under the same name is counted as received and assembled in.
+    expect(partIndexFromFileName(partFileName(2, OTHER_TAG), TAG)).toBeNull();
+    expect(parsePartFileName(partFileName(2, OTHER_TAG))).toEqual({ index: 2, tag: OTHER_TAG });
   });
 
   it('round-trips with partFileName at every boundary', () => {
     for (const index of [1, 2, 199, 200, 201, MAX_PART_COUNT]) {
-      expect(partIndexFromFileName(partFileName(index))).toBe(index);
+      expect(partIndexFromFileName(partFileName(index, TAG), TAG)).toBe(index);
     }
   });
 });

@@ -72,6 +72,89 @@ test('resumes after a pause and a page reload, sending only the missing parts', 
   await expect(page.getByTestId('sha256')).toHaveText(sha256OfFixture('resumable'));
 });
 
+test('recovers from a 429 and a 503 mid-upload, throttling down, with identical bytes stored', async ({ page }) => {
+  // One part is rate-limited (with Retry-After) and another fails with a server
+  // error, once each. The upload must retry both through real XHR, show that it
+  // was throttled, and still store exactly the source bytes.
+  const failed = new Set<string>();
+  let throttledShown = false;
+  await page.route(PART_PUT, async (route) => {
+    const index = route.request().url().split('/').at(-1) as string;
+    if (index === '2' && !failed.has('429')) {
+      failed.add('429');
+      return route.fulfill({ status: 429, headers: { 'retry-after': '1' }, contentType: 'application/json', body: JSON.stringify({ error: { code: 'RATE_LIMITED', message: 'Slow down' } }) });
+    }
+    if (index === '5' && !failed.has('503')) {
+      failed.add('503');
+      return route.fulfill({ status: 503, body: '' });
+    }
+    return route.continue().catch(() => undefined);
+  });
+
+  await page.goto('/');
+  await page.getByTestId('file-input').setInputFiles(fixturePath('retried'));
+  await page.getByTestId('start').click();
+  await expect
+    .poll(async () => {
+      throttledShown ||= ((await page.getByTestId('bytes').textContent().catch(() => '')) ?? '').includes('throttled');
+      return page.getByTestId('status').textContent();
+    }, { timeout: 60_000, intervals: [50] })
+    .toBe('Upload complete');
+
+  expect([...failed].sort()).toEqual(['429', '503']); // both failures were really injected
+  expect(throttledShown).toBe(true);
+  await expect(page.getByTestId('sha256')).toHaveText(sha256OfFixture('retried'));
+});
+
+test('discard during an upload removes everything from the server', async ({ page }) => {
+  await page.route(PART_PUT, async (route) => {
+    await new Promise((r) => setTimeout(r, 150));
+    await route.continue().catch(() => undefined);
+  });
+  await page.goto('/');
+  await page.getByTestId('file-input').setInputFiles(fixturePath('discarded'));
+  await page.getByTestId('start').click();
+  await expect(page.getByTestId('bytes')).toContainText(/part [2-9]\//, { timeout: 30_000 });
+
+  await page.getByTestId('discard').click();
+  await expect(page.getByTestId('status')).toHaveText('Ready');
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+
+  // Parts already in flight may land after the DELETE; give them time, then ask
+  // the server directly rather than trusting the UI.
+  await page.waitForTimeout(500);
+  const listed = await (await page.request.get('/api/uploads')).json();
+  expect(listed.uploads.map((u: { fileName: string }) => u.fileName)).not.toContain(FIXTURES.discarded.name);
+});
+
+test('a different file with the same name is refused, not merged into the first', async ({ page }) => {
+  // Start one report.pdf and pause it; then pick a DIFFERENT report.pdf. The
+  // server must refuse with 409 rather than resume onto the first file's parts.
+  await page.route(PART_PUT, async (route) => {
+    await new Promise((r) => setTimeout(r, 150));
+    await route.continue().catch(() => undefined);
+  });
+  await page.goto('/');
+  await page.getByTestId('file-input').setInputFiles(fixturePath('clash'));
+  await page.getByTestId('start').click();
+  await expect(page.getByTestId('bytes')).toContainText(/part [2-9]\//, { timeout: 30_000 });
+  await page.getByTestId('pause').click();
+  await expect(page.getByTestId('status')).toHaveText(/Paused/);
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+
+  await page.getByTestId('file-input').setInputFiles(fixturePath('clashOther'));
+  await page.getByTestId('start').click();
+  await expect(page.getByTestId('error')).toContainText('already uses this name');
+  await expect(page.getByTestId('status')).toHaveText('Upload failed');
+
+  // The first file is untouched and still resumable to its own exact bytes.
+  await page.getByTestId('file-input').setInputFiles(fixturePath('clash'));
+  await page.getByTestId('start').click();
+  await expect(page.getByTestId('resumed')).toBeVisible();
+  await expect(page.getByTestId('status')).toHaveText('Upload complete', { timeout: 60_000 });
+  await expect(page.getByTestId('sha256')).toHaveText(sha256OfFixture('clash'));
+});
+
 test('refuses a file over MULTIPART_UPLOAD_MAX_FILE_BYTES without sending any part', async ({ page }) => {
   let partRequests = 0;
   page.on('request', (req) => {

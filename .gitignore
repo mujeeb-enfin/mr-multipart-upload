@@ -20,3 +20,4 @@ coverage/
 .env.local
 *.log
 .DS_Store
+.vscode

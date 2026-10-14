@@ -143,6 +143,29 @@ describe('limits', () => {
     expect(pulled).toBeLessThanOrEqual(10); // stopped just past 8 MiB
   });
 
+  it('treats a client that disconnects mid-part as a client event, not a server error', async () => {
+    // Pausing or discarding aborts the browser's in-flight part requests, so the
+    // server sees the body stream fail (ECONNRESET). Reporting that through
+    // onError made every pause log an error on the server. Found by the browser
+    // test suite, which printed "[multipart-upload] Error: aborted".
+    const onError = vi.fn();
+    const r = routes({ onError });
+    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: 3 * MIB, fingerprint: 'fp' }));
+    let sent = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent++ === 0) return controller.enqueue(new Uint8Array(256 * 1024));
+        controller.error(Object.assign(new Error('aborted'), { code: 'ECONNRESET' }));
+      },
+    });
+    const res = await r.PUT(
+      new Request(`${BASE}/a-bin/parts/1`, { method: 'PUT', headers: { ...asUser, 'x-upload-fingerprint': 'fp' }, body, duplex: 'half' } as RequestInit),
+    );
+    expect(res.status).toBe(400);
+    expect(await errorCode(res)).toBe('CLIENT_DISCONNECTED');
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('rejects oversized JSON at begin', async () => {
     const res = await routes({ maxMetadataBytes: 100 }).POST(
       beginRequest({ fileName: 'a.bin', totalBytes: 10, fingerprint: 'fp', metadata: { x: 'y'.repeat(20_000) } }),

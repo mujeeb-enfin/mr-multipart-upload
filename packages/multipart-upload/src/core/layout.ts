@@ -6,9 +6,20 @@
 //
 //   namespace directory   sha256 of the caller's namespace (see namespace.ts)
 //   session directory     the file name, slugified (slug.ts)
-//   part file             its 1-based index, zero padded
+//   part file             its 1-based index, zero padded, plus the PART TAG
 //   manifest / staging / lock   fixed names
 //   final file            the sha256 of the assembled bytes
+//
+// THE PART TAG binds every part to the file it belongs to: 16 hex characters
+// derived from the upload's fingerprint, e.g. `000002.3f9a1c07b2d4e816.part`.
+// Without it a part file's SIZE was the only evidence of its identity, and that
+// was not enough. A part write that was already in flight when its upload was
+// discarded could land afterwards, leaving an orphan. A DIFFERENT file uploaded
+// later under the same name then found a correctly-sized `000002.part`, treated
+// it as already received, and assembled the old file's bytes into the new one —
+// reported as a success. With the tag, the orphan has a different name from
+// anything the new upload reads or writes, so it is never counted, never reused,
+// and `complete` deletes it.
 //
 // That is a constraint, not an aesthetic. A random component anywhere in a
 // resumable upload has to be PERSISTED to be useful on the next attempt, and
@@ -53,8 +64,11 @@ export const PART_NUMBER_WIDTH = 6;
 /** The most parts a single upload may have — the padding's capacity. */
 export const MAX_PART_COUNT = 10 ** PART_NUMBER_WIDTH - 1;
 
-/** Exactly a part filename: six digits, `.part`, nothing else. */
-const PART_FILE_NAME = /^[0-9]{6}\.part$/;
+/** A part tag: 16 lowercase hex characters, derived from the fingerprint. */
+const PART_TAG = /^[0-9a-f]{16}$/;
+
+/** Exactly a part filename: six digits, a tag, `.part`, nothing else. */
+const PART_FILE_NAME = /^([0-9]{6})\.([0-9a-f]{16})\.part$/;
 
 /** Directory holding every session of one namespace. */
 export function namespaceDirKey(namespaceKey: string): string {
@@ -78,27 +92,43 @@ export function lockKey(namespaceKey: string, uploadId: string): string {
   return `${sessionKey(namespaceKey, uploadId)}/${LOCK_FILE}`;
 }
 
-/** Part filename for a 1-based index, zero padded so it sorts numerically. */
-export function partFileName(index: number): string {
+/**
+ * Part filename for a 1-based index and the upload's part tag. The index is
+ * zero padded so names sort numerically.
+ */
+export function partFileName(index: number, tag: string): string {
   if (!Number.isInteger(index) || index < 1 || index > MAX_PART_COUNT) {
     throw new UploadError('PART_OUT_OF_RANGE', `Part index ${index} is out of range`);
   }
-  return `${String(index).padStart(PART_NUMBER_WIDTH, '0')}.part`;
+  if (!PART_TAG.test(tag)) {
+    throw new UploadError('CONFIG_INVALID', `Part tag "${tag}" must be 16 lowercase hex characters`);
+  }
+  return `${String(index).padStart(PART_NUMBER_WIDTH, '0')}.${tag}.part`;
 }
 
-export function partKey(namespaceKey: string, uploadId: string, index: number): string {
-  return `${sessionKey(namespaceKey, uploadId)}/${partFileName(index)}`;
+export function partKey(namespaceKey: string, uploadId: string, index: number, tag: string): string {
+  return `${sessionKey(namespaceKey, uploadId)}/${partFileName(index, tag)}`;
 }
 
 /**
- * The index a directory entry names, or null when it is not a part file.
+ * The index and tag a directory entry names, or null when it is not a part file.
  *
- * Anchored at BOTH ends, so nothing that merely starts or ends like a part file
- * is counted — the manifest, the staging file, the lock and any leftover are all
+ * Anchored at BOTH ends, so nothing that merely resembles a part file is
+ * accepted — the manifest, the staging file, the lock and any leftover are all
  * rejected here rather than needing a separate exclusion list kept in step.
  */
-export function partIndexFromFileName(name: string): number | null {
-  if (!PART_FILE_NAME.test(name)) return null;
-  const index = Number(name.slice(0, PART_NUMBER_WIDTH));
-  return index >= 1 ? index : null;
+export function parsePartFileName(name: string): { index: number; tag: string } | null {
+  const match = PART_FILE_NAME.exec(name);
+  if (!match) return null;
+  const index = Number(match[1]);
+  return index >= 1 ? { index, tag: match[2] as string } : null;
+}
+
+/**
+ * The index a directory entry names IF it belongs to the upload with `tag`,
+ * otherwise null. A part of another file — an orphan — is never counted.
+ */
+export function partIndexFromFileName(name: string, tag: string): number | null {
+  const parsed = parsePartFileName(name);
+  return parsed && parsed.tag === tag ? parsed.index : null;
 }

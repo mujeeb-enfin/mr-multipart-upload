@@ -13,3 +13,5 @@ First release.
 - `validateHead` and `onComplete` hooks; configurable `destination`.
 - Stale-lock takeover and opportunistic cleanup of abandoned uploads.
 - `StorageAdapter` interface with a filesystem implementation (interface experimental).
+- Part files are tagged with a hash of the file's fingerprint, so a part from a discarded upload can never be assembled into a later file with the same name.
+- The fingerprint samples the first and last 64 KB of the file, so files sharing name, size and modification time are still told apart. `fingerprintFor()` is async.

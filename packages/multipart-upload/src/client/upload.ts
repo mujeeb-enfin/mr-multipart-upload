@@ -137,7 +137,8 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
   const sendPart = options.sendPart ?? xhrPartSender;
   const credentials = options.credentials ?? 'same-origin';
   const maxAttempts = options.maxAttemptsPerPart ?? DEFAULT_MAX_ATTEMPTS;
-  const fingerprint = fingerprintFor(file);
+  // Computed at the start of run(): it reads two small samples of the file.
+  let fingerprint = '';
   const controller = new AbortController();
 
   let uploadId: string | null = null;
@@ -163,18 +164,22 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
     onProgress({ percent, sentBytes, totalBytes: file.size, partsDone: settled.size, partsTotal: partCount, phase });
   }
 
-  async function control<T>(method: string, path: string, body?: unknown): Promise<T | null> {
+  /**
+   * A JSON control request. `abortable: false` for requests that must finish even
+   * after pause/discard: `begin` (see below) and the discard's own DELETE.
+   */
+  async function control<T>(method: string, path: string, body?: unknown, abortable = true): Promise<T | null> {
     let response: Response;
     try {
       response = await fetchImpl(`${endpoint}${path}`, {
         method,
         credentials,
-        signal: method === 'DELETE' ? undefined : controller.signal,
+        signal: abortable ? controller.signal : undefined,
         headers: await headers(body === undefined ? {} : { 'content-type': 'application/json' }),
         body: body === undefined ? undefined : JSON.stringify(body),
       });
     } catch (err) {
-      if (controller.signal.aborted && method !== 'DELETE') throw new UploadClientError('Paused.', 0, 'PAUSED');
+      if (abortable && controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
       throw new UploadClientError(err instanceof Error ? err.message : 'Network error', 0, 'NETWORK');
     }
     if (response.status === 204) return null;
@@ -260,16 +265,31 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
     }
   }
 
+  // `begin` is NOT abortable. The server may create the upload before the client
+  // hears back; aborting would leave the client without its id, so a discard
+  // could not delete it and the "discarded" upload would linger until the sweep.
+  // `begin` takes milliseconds, so letting it finish costs nothing, and
+  // `discard()` waits on this before deleting.
+  let beginSettled: Promise<unknown> = Promise.resolve();
+
   async function run(): Promise<UploadResult> {
-    const begun = await control<UploadStartInfo & { missingParts: number[] }>('POST', '', {
-      fileName: file.name,
-      totalBytes: file.size,
-      fingerprint,
-      metadata: options.metadata ?? {},
-    });
+    fingerprint = await fingerprintFor(file);
+    // Paused or discarded while the file was being sampled: never send begin.
+    // From here to `beginSettled` below is synchronous, so a discard either
+    // happened before this check (begin is not sent) or after (it waits for it).
+    if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
+    const beginRequest = control<UploadStartInfo & { missingParts: number[] }>(
+      'POST',
+      '',
+      { fileName: file.name, totalBytes: file.size, fingerprint, metadata: options.metadata ?? {} },
+      false,
+    );
+    beginSettled = beginRequest.catch(() => undefined);
+    const begun = await beginRequest;
     if (!begun) throw new UploadClientError('The server did not start the upload.', 0);
 
     uploadId = begun.uploadId;
+    if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
     partBytes = begun.partBytes;
     partCount = begun.partCount;
     options.onStart?.({
@@ -346,7 +366,9 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
     pause: () => controller.abort(),
     discard: async () => {
       controller.abort();
-      if (uploadId) await control('DELETE', `/${encodeURIComponent(uploadId)}`).catch(() => undefined);
+      // If begin is still in flight, wait for it: only then is the id known.
+      await beginSettled;
+      if (uploadId) await control('DELETE', `/${encodeURIComponent(uploadId)}`, undefined, false).catch(() => undefined);
     },
   };
 }
