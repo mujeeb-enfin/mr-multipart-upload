@@ -20,3 +20,11 @@ export { UploadError, isUploadError } from '../core/errors.js';
 export type { UploadErrorCode } from '../core/errors.js';
 export type { UploadMetadata, JsonValue, UploadManifest, UploadSession } from '../core/session.js';
 export { slugifyFileName, uploadIdForFileName } from '../core/slug.js';
+
+// Ready-made allowedTypes lists: allowedTypes: [...FILE_TYPES.images, ...FILE_TYPES.pdf]
+export { FILE_TYPES } from '../core/file-type-presets.js';
+export type { FileTypePreset } from '../core/file-type-presets.js';
+
+// For applications that want the same content check inside validateHead.
+export { detectFileType, typeForExtension } from '../core/file-signatures.js';
+export type { DetectedFileType } from '../core/file-signatures.js';

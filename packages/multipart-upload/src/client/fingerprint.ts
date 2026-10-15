@@ -3,8 +3,9 @@
 // ---------------------------------------------------------------------------
 //
 // It lets the server tell "the same file again" (resume) from "a different file
-// with the same name" (refuse with 409). Every part of the upload is also tagged
-// with it on the server, so it decides which stored parts belong to the file.
+// with the same name" (a separate upload). The server hashes it, with the name,
+// size and MIME type, into the upload id and temporary folder; every part is
+// also tagged with it, so it decides which stored parts belong to the file.
 //
 // DERIVED, NOT STORED. A random id kept in sessionStorage breaks the case resume
 // exists for: sessionStorage is per-tab and cleared when the tab closes, so

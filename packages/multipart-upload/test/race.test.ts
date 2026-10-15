@@ -82,35 +82,33 @@ it('a part written after its upload was discarded can never leak into a later, d
 
   // File A: begin, then a part 2 write that passes the fingerprint check and is
   // held just before it reaches the disk.
-  await up.begin(ALICE, { fileName: 'video.mp4', totalBytes: SIZE, fingerprint: fpA });
+  const idA = (await up.begin(ALICE, { fileName: 'video.mp4', totalBytes: SIZE, fingerprint: fpA })).session.manifest.uploadId;
   const held = gate.holdNextPartWrite(2);
-  const inFlight = up.putPart(ALICE, { uploadId: 'video-mp4', index: 2, bytes: partOf(fileA, 2, MIB), fingerprint: fpA });
+  const inFlight = up.putPart(ALICE, { uploadId: idA, index: 2, bytes: partOf(fileA, 2, MIB), fingerprint: fpA });
   await held.reached;
 
   // The user discards A while that write is in flight, and the write then lands.
-  await up.discard(ALICE, 'video-mp4');
+  await up.discard(ALICE, idA);
   held.release();
   await inFlight.catch(() => undefined);
 
-  // File B, same name. Every part the server says is missing is sent.
+  // File B, same name and size, different content. Its upload id is the SHA-256
+  // of a different fingerprint, so it gets its OWN folder: A's orphan part 2 sits
+  // in A's folder, not beside B's parts. (Before 0.2.0 both shared a folder named
+  // after the file, and only the fingerprint tag on each part file kept them
+  // apart; that tag is still checked, as a second line of defence.)
+  // MUTATION: derive the upload id from the file name only -> B shares A's
+  // folder, and only the part tags stand between A's bytes and B's file.
   const begun = await up.begin(ALICE, { fileName: 'video.mp4', totalBytes: SIZE, fingerprint: fpB });
+  const idB = begun.session.manifest.uploadId;
+  expect(idB).not.toBe(idA);
   expect(begun.created).toBe(true);
   expect(begun.session.missingParts).toEqual([1, 2, 3, 4]);
 
-  // Send every part EXCEPT 2, then ask the server what is missing. That resume
-  // scan lists the directory, where A's orphan part 2 now sits beside B's parts.
-  // MUTATION: count parts regardless of their tag -> the scan reports nothing
-  // missing, `complete` proceeds, and A's part 2 is assembled into B.
-  for (const index of [1, 3, 4]) {
-    await up.putPart(ALICE, { uploadId: 'video-mp4', index, bytes: partOf(fileB, index, MIB), fingerprint: fpB });
+  for (const index of [1, 2, 3, 4]) {
+    await up.putPart(ALICE, { uploadId: idB, index, bytes: partOf(fileB, index, MIB), fingerprint: fpB });
   }
-  expect((await up.status(ALICE, 'video-mp4')).missingParts).toEqual([2]);
-
-  // MUTATION: name parts without the tag -> B's part 2 write finds A's orphan at
-  // the same key, takes it as "already present", and keeps A's bytes.
-  await up.putPart(ALICE, { uploadId: 'video-mp4', index: 2, bytes: partOf(fileB, 2, MIB), fingerprint: fpB });
-
-  const done = await up.complete(ALICE, 'video-mp4');
+  const done = await up.complete(ALICE, idB);
   expect(done.sha256).toBe(sha256(fileB));
   expect(done.sha256).not.toBe(sha256(fileA));
 });

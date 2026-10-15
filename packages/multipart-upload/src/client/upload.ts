@@ -88,6 +88,8 @@ export interface UploadResult {
   readonly key: string;
   readonly size: number;
   readonly sha256: string;
+  /** The stored file's type — detected from its content where the format allows. */
+  readonly contentType: string;
   readonly deduplicated: boolean;
   /** Whatever the server's `onComplete` returned. */
   readonly result: unknown;
@@ -307,7 +309,10 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
     const beginRequest = control<UploadStartInfo & { missingParts: number[] }>(
       'POST',
       '',
-      { fileName: file.name, totalBytes: file.size, fingerprint, metadata: options.metadata ?? {} },
+      // contentType lets the server refuse a disallowed type before any part is
+      // sent. It is only the browser's guess from the name; the server also
+      // checks the real content before storing the file.
+      { fileName: file.name, totalBytes: file.size, fingerprint, metadata: options.metadata ?? {}, contentType: file.type },
       false,
     );
     beginSettled = beginRequest.catch(() => undefined);

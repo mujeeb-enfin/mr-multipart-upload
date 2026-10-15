@@ -15,3 +15,6 @@ export { fingerprintFor } from './fingerprint.js';
 export type { FingerprintSource } from './fingerprint.js';
 export { xhrPartSender, fetchPartSender } from './transport.js';
 export type { PartSender, PartRequest, PartResponse } from './transport.js';
+// The same lists as the server's, for <input accept={FILE_TYPES.images.join(',')}>.
+export { FILE_TYPES } from '../core/file-type-presets.js';
+export type { FileTypePreset } from '../core/file-type-presets.js';

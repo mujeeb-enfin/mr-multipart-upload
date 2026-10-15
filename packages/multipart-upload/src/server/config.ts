@@ -10,6 +10,7 @@
 //   MULTIPART_UPLOAD_DIR              storage root                 default ./uploads
 //   MULTIPART_UPLOAD_PART_TTL_HOURS   unfinished uploads expire    default 48
 //   MULTIPART_UPLOAD_INSTANCE_ID      set per instance if >1       default "single"
+//   MULTIPART_UPLOAD_ALLOWED_TYPES    e.g. image/*,application/pdf default: every type
 //
 // READ ON EVERY CALL, not captured in module constants. A constant is fixed the
 // moment the module loads, so neither a changed `.env` (after a restart that
@@ -25,6 +26,7 @@ import { resolve } from 'node:path';
 
 import { UploadError } from '../core/errors.js';
 import { MAX_PART_COUNT } from '../core/layout.js';
+import { normaliseAllowedTypes } from './file-types.js';
 
 export const MIB = 1024 * 1024;
 export const MIN_PART_BYTES = 1 * MIB;
@@ -42,6 +44,7 @@ export const ENV = {
   dir: 'MULTIPART_UPLOAD_DIR',
   partTtlHours: 'MULTIPART_UPLOAD_PART_TTL_HOURS',
   instanceId: 'MULTIPART_UPLOAD_INSTANCE_ID',
+  allowedTypes: 'MULTIPART_UPLOAD_ALLOWED_TYPES',
 } as const;
 
 /**
@@ -60,6 +63,14 @@ export interface ConfigOverrides {
   partTtlMs?: number;
   /** A distinct value per server when running more than one. Falls back to MULTIPART_UPLOAD_INSTANCE_ID, then "single". */
   instanceId?: string;
+  /**
+   * File types accepted, in the syntax of the HTML `accept` attribute:
+   * `['image/*', 'application/pdf', '.zip']`. Checked by declared type when the
+   * upload begins and by actual content before it is stored. Falls back to
+   * MULTIPART_UPLOAD_ALLOWED_TYPES (comma-separated), then every type. Pass `[]`
+   * to allow every type even when the variable is set.
+   */
+  allowedTypes?: readonly string[];
 }
 
 export interface ResolvedConfig {
@@ -69,6 +80,8 @@ export interface ResolvedConfig {
   readonly dir: string;
   readonly partTtlMs: number;
   readonly instanceId: string;
+  /** Lowercased and validated. Empty: every type is allowed. */
+  readonly allowedTypes: readonly string[];
 }
 
 function invalid(source: string, message: string): never {
@@ -131,5 +144,15 @@ export function resolveConfig(overrides: ConfigOverrides = {}): ResolvedConfig {
   const instanceId = rawInstance && rawInstance.trim() !== '' ? rawInstance.trim() : DEFAULT_INSTANCE_ID;
   if (instanceId.length > 128) invalid(ENV.instanceId, 'must be at most 128 characters');
 
-  return { maxFileBytes, partBytes, dir, partTtlMs, instanceId };
+  let allowedTypes: string[];
+  if (overrides.allowedTypes !== undefined) {
+    if (!Array.isArray(overrides.allowedTypes)) invalid('Option allowedTypes', 'must be an array of strings');
+    allowedTypes = normaliseAllowedTypes(overrides.allowedTypes, 'Option allowedTypes');
+  } else {
+    const rawTypes = process.env[ENV.allowedTypes] ?? '';
+    const entries = rawTypes.split(',').map((entry) => entry.trim()).filter((entry) => entry !== '');
+    allowedTypes = normaliseAllowedTypes(entries, ENV.allowedTypes);
+  }
+
+  return { maxFileBytes, partBytes, dir, partTtlMs, instanceId, allowedTypes };
 }

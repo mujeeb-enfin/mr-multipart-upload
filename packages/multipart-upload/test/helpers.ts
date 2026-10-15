@@ -13,6 +13,7 @@ const ENV_KEYS = [
   'MULTIPART_UPLOAD_DIR',
   'MULTIPART_UPLOAD_PART_TTL_HOURS',
   'MULTIPART_UPLOAD_INSTANCE_ID',
+  'MULTIPART_UPLOAD_ALLOWED_TYPES',
 ] as const;
 
 export function clearEnv(): void {

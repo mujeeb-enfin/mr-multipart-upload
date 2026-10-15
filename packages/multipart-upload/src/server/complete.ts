@@ -7,7 +7,8 @@
 //   lock        two concurrent completes cannot both assemble
 //   prune       remove wrong-size parts — safe only now, under the lock
 //   verify      refuse while any part is missing, naming which
-//   head        let the application reject the file BEFORE assembling 400 MB
+//   head        check the content against allowedTypes, then let the
+//               application reject the file — BEFORE assembling 400 MB
 //   assemble    stream + hash in one pass; byte count must equal the manifest
 //   dedupe      identical bytes already stored -> reuse, do not duplicate
 //   promote     publish at the content-addressed key
@@ -26,7 +27,9 @@
 import { UploadError } from '../core/errors.js';
 import { FILES_DIR, PARTS_DIR, lockKey, parsePartFileName, partKey, sessionKey, stagingKey } from '../core/layout.js';
 import { expectedPartBytes } from '../core/arithmetic.js';
+import { SIGNATURE_BYTES } from '../core/file-signatures.js';
 import type { UploadMetadata } from '../core/session.js';
+import { assertContentAllowed, declaredTypeFor } from './file-types.js';
 import { partTagFor } from './namespace.js';
 import { readManifest, readSession, type StoreContext } from './store.js';
 import type { UploaderOptions } from './uploader.js';
@@ -44,6 +47,11 @@ export interface CompletedFile {
   readonly sha256: string;
   /** The file name the user picked. */
   readonly fileName: string;
+  /**
+   * The file's MIME type: detected from its content when the format has a known
+   * signature, otherwise the type declared at begin. Use this, not the name.
+   */
+  readonly contentType: string;
   /** Stream the stored file. */
   read(): ReadableStream<Uint8Array>;
 }
@@ -63,6 +71,8 @@ export interface CompleteResult {
   readonly key: string;
   readonly size: number;
   readonly sha256: string;
+  /** Same as `CompletedFile.contentType`. */
+  readonly contentType: string;
   readonly deduplicated: boolean;
   /** Whatever `onComplete` returned. */
   readonly result: unknown;
@@ -166,13 +176,20 @@ export async function completeUpload(
     }
 
     const tag = partTagFor(manifest.fingerprint);
+    // One read serves both checks below; part 1 is the start of the file.
+    const headBytes = options.headBytes ?? DEFAULT_HEAD_BYTES;
+    const head = await store.storage.readHead(
+      partKey(store.namespaceKey, uploadId, 1, tag),
+      Math.max(headBytes, SIGNATURE_BYTES),
+    );
+    // allowedTypes check 2 of 2: the CONTENT, not the name. Parts are kept on a
+    // refusal, like validateHead: the policy may be what is wrong.
+    const declaredType = manifest.contentType ?? declaredTypeFor(manifest.fileName, undefined);
+    const contentType = assertContentAllowed(store.config.allowedTypes, head, manifest.fileName, declaredType);
+
     if (options.validateHead) {
-      const head = await store.storage.readHead(
-        partKey(store.namespaceKey, uploadId, 1, tag),
-        options.headBytes ?? DEFAULT_HEAD_BYTES,
-      );
       try {
-        await options.validateHead(head, {
+        await options.validateHead(head.subarray(0, headBytes), {
           fileName: manifest.fileName,
           totalBytes: manifest.totalBytes,
           metadata: manifest.metadata,
@@ -218,6 +235,7 @@ export async function completeUpload(
       size: assembly.bytesWritten,
       sha256: assembly.sha256,
       fileName: manifest.fileName,
+      contentType,
       read: () => store.storage.openRead(key),
     };
 
@@ -235,7 +253,16 @@ export async function completeUpload(
     }
 
     await store.storage.removeTree(sessionKey(store.namespaceKey, uploadId));
-    return { uploadId, fileName: manifest.fileName, key, size: assembly.bytesWritten, sha256: assembly.sha256, deduplicated, result };
+    return {
+      uploadId,
+      fileName: manifest.fileName,
+      key,
+      size: assembly.bytesWritten,
+      sha256: assembly.sha256,
+      contentType,
+      deduplicated,
+      result,
+    };
   } finally {
     if (stagingExists) await store.storage.remove(staging).catch(() => undefined);
     // Absent after a successful complete (the session tree is gone): a no-op.

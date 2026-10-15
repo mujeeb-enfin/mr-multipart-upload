@@ -1,6 +1,6 @@
 {
   "name": "@mr_innovations/multipart-upload",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Resumable multipart file uploads for Next.js — server route handlers, browser client and React hook. No database: the filesystem is the state.",
   "keywords": [
     "upload",
@@ -11,10 +11,22 @@
     "nextjs",
     "next",
     "react",
-    "app-router"
+    "app-router",
+    "file-type",
+    "mime-type",
+    "sha256"
   ],
   "license": "MIT",
   "author": "mujeeb-enfin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mujeeb-enfin/mr-multipart-upload.git",
+    "directory": "packages/multipart-upload"
+  },
+  "homepage": "https://github.com/mujeeb-enfin/mr-multipart-upload/tree/main/packages/multipart-upload#readme",
+  "bugs": {
+    "url": "https://github.com/mujeeb-enfin/mr-multipart-upload/issues"
+  },
   "type": "module",
   "sideEffects": false,
   "engines": {

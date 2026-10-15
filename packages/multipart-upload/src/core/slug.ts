@@ -1,11 +1,15 @@
 // ---------------------------------------------------------------------------
-// slug.ts — turning a file name into a safe, derived upload id
+// slug.ts — the upload-id allowlist, and the name-based ids of 0.1.x
 // ---------------------------------------------------------------------------
 //
-// An upload's parts live in a directory named after the FILE NAME, so an
-// interrupted upload is found again just by picking the same file. That means
-// arbitrary human text reaches the filesystem, and this module is the only thing
-// between the two.
+// SINCE 0.2.0 UPLOAD IDS ARE SHA-256 HASHES (server/namespace.ts uploadIdFor),
+// so no file name reaches the filesystem. `assertSafeUploadId` is still the gate
+// every id from a URL passes. `slugifyFileName` / `uploadIdForFileName` are kept
+// exported for compatibility; they no longer name anything the server creates.
+//
+// What follows describes the 0.1.x scheme. An upload's parts lived in a
+// directory named after the FILE NAME, so arbitrary human text reached the
+// filesystem, and this module was the only thing between the two.
 //
 // TRANSFORM, then ALLOWLIST THE RESULT, then THROW. Real names such as
 // `Café — Été №1.mp3`, `日本語のBGM.wav` and `Vol. 2 (Remastered).flac` are
@@ -99,7 +103,10 @@ export function assertSafeUploadId(id: string): void {
   }
 }
 
-/** Slugify and validate in one step. */
+/**
+ * Slugify and validate in one step.
+ * @deprecated Since 0.2.0 the server's upload ids are SHA-256 hashes, not slugs.
+ */
 export function uploadIdForFileName(name: string): string {
   const id = slugifyFileName(name);
   assertSafeUploadId(id);

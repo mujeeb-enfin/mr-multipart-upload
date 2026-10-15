@@ -48,6 +48,11 @@ function beginRequest(body: unknown, headers: Record<string, string> = asUser) {
   return new Request(BASE, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(body) });
 }
 
+/** Begin an upload and return the id the server assigned (a SHA-256). */
+async function beginId(r: UploadRoutes, body: unknown): Promise<string> {
+  return ((await (await r.POST(beginRequest(body))).json()) as { uploadId: string }).uploadId;
+}
+
 function partRequest(id: string, index: number | string, bytes: Uint8Array<ArrayBuffer>, fingerprint: string | null = 'fp') {
   const headers: Record<string, string> = { ...asUser };
   if (fingerprint) headers['x-upload-fingerprint'] = fingerprint;
@@ -76,29 +81,31 @@ describe('the full flow over HTTP', () => {
     expect(first.status).toBe(201);
     expect(first.headers.get('cache-control')).toBe('no-store');
     const session = (await first.json()) as { uploadId: string; partCount: number; missingParts: number[]; maxFileBytes: number };
-    expect(session).toMatchObject({ uploadId: 'talk-m4a', partCount: 3, missingParts: [1, 2, 3], maxFileBytes: 500 * MIB });
+    expect(session).toMatchObject({ partCount: 3, missingParts: [1, 2, 3], maxFileBytes: 500 * MIB });
+    expect(session.uploadId).toMatch(/^[0-9a-f]{64}$/); // SHA-256 of name, size, type and fingerprint
+    const id = session.uploadId;
 
-    expect((await r.PUT(partRequest('talk-m4a', 1, partOf(bytes, 1, MIB)))).status).toBe(200);
+    expect((await r.PUT(partRequest(id, 1, partOf(bytes, 1, MIB)))).status).toBe(200);
 
     const resumed = await r.POST(beginRequest(begin));
     expect(resumed.status).toBe(200); // resume, not create
-    expect(((await resumed.json()) as { missingParts: number[] }).missingParts).toEqual([2, 3]);
+    expect((await resumed.json()) as { uploadId: string; missingParts: number[] }).toMatchObject({ uploadId: id, missingParts: [2, 3] });
 
-    for (const i of [2, 3]) expect((await r.PUT(partRequest('talk-m4a', i, partOf(bytes, i, MIB)))).status).toBe(200);
+    for (const i of [2, 3]) expect((await r.PUT(partRequest(id, i, partOf(bytes, i, MIB)))).status).toBe(200);
 
-    const done = await r.POST(new Request(`${BASE}/talk-m4a/complete`, { method: 'POST', headers: asUser }));
+    const done = await r.POST(new Request(`${BASE}/${id}/complete`, { method: 'POST', headers: asUser }));
     expect(done.status).toBe(201);
     expect(await done.json()).toMatchObject({ sha256: sha256(bytes), size: bytes.byteLength, result: { saved: 'Talk' } });
   });
 
   it('lists, reports status and discards', async () => {
     const r = routes();
-    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: 10, fingerprint: 'fp' }));
-    const list = (await (await r.GET(new Request(BASE, { headers: asUser }))).json()) as { uploads: { uploadId: string }[] };
-    expect(list.uploads.map((u) => u.uploadId)).toEqual(['a-bin']);
-    expect((await r.GET(new Request(`${BASE}/a-bin`, { headers: asUser }))).status).toBe(200);
-    expect((await r.DELETE(new Request(`${BASE}/a-bin`, { method: 'DELETE', headers: asUser }))).status).toBe(204);
-    const gone = await r.GET(new Request(`${BASE}/a-bin`, { headers: asUser }));
+    const { uploadId: id } = (await (await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: 10, fingerprint: 'fp' }))).json()) as { uploadId: string };
+    const list = (await (await r.GET(new Request(BASE, { headers: asUser }))).json()) as { uploads: { uploadId: string; fileName: string }[] };
+    expect(list.uploads.map((u) => [u.uploadId, u.fileName])).toEqual([[id, 'a.bin']]);
+    expect((await r.GET(new Request(`${BASE}/${id}`, { headers: asUser }))).status).toBe(200);
+    expect((await r.DELETE(new Request(`${BASE}/${id}`, { method: 'DELETE', headers: asUser }))).status).toBe(204);
+    const gone = await r.GET(new Request(`${BASE}/${id}`, { headers: asUser }));
     expect(gone.status).toBe(404);
     expect(await errorCode(gone)).toBe('NO_SESSION');
   });
@@ -114,9 +121,9 @@ describe('limits', () => {
 
   it('refuses a part by its Content-Length before reading it', async () => {
     const r = routes();
-    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: 3 * MIB, fingerprint: 'fp' }));
+    const id = await beginId(r, { fileName: 'a.bin', totalBytes: 3 * MIB, fingerprint: 'fp' });
     const res = await r.PUT(
-      new Request(`${BASE}/a-bin/parts/1`, {
+      new Request(`${BASE}/${id}/parts/1`, {
         method: 'PUT',
         headers: { ...asUser, 'x-upload-fingerprint': 'fp', 'content-length': String(9 * MIB) },
         body: new Uint8Array(10),
@@ -129,7 +136,7 @@ describe('limits', () => {
   it('stops reading a streamed part that exceeds the cap with no Content-Length', async () => {
     // A lying or absent header must not let a client stream gigabytes into memory.
     const r = routes();
-    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: 3 * MIB, fingerprint: 'fp' }));
+    const id = await beginId(r, { fileName: 'a.bin', totalBytes: 3 * MIB, fingerprint: 'fp' });
     let pulled = 0;
     const body = new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -139,7 +146,7 @@ describe('limits', () => {
       },
     });
     const res = await r.PUT(
-      new Request(`${BASE}/a-bin/parts/1`, { method: 'PUT', headers: { ...asUser, 'x-upload-fingerprint': 'fp' }, body, duplex: 'half' } as RequestInit),
+      new Request(`${BASE}/${id}/parts/1`, { method: 'PUT', headers: { ...asUser, 'x-upload-fingerprint': 'fp' }, body, duplex: 'half' } as RequestInit),
     );
     expect(res.status).toBe(413);
     expect(pulled).toBeLessThanOrEqual(10); // stopped just past 8 MiB
@@ -152,7 +159,7 @@ describe('limits', () => {
     // test suite, which printed "[multipart-upload] Error: aborted".
     const onError = vi.fn();
     const r = routes({ onError });
-    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: 3 * MIB, fingerprint: 'fp' }));
+    const id = await beginId(r, { fileName: 'a.bin', totalBytes: 3 * MIB, fingerprint: 'fp' });
     let sent = 0;
     const body = new ReadableStream<Uint8Array>({
       pull(controller) {
@@ -161,7 +168,7 @@ describe('limits', () => {
       },
     });
     const res = await r.PUT(
-      new Request(`${BASE}/a-bin/parts/1`, { method: 'PUT', headers: { ...asUser, 'x-upload-fingerprint': 'fp' }, body, duplex: 'half' } as RequestInit),
+      new Request(`${BASE}/${id}/parts/1`, { method: 'PUT', headers: { ...asUser, 'x-upload-fingerprint': 'fp' }, body, duplex: 'half' } as RequestInit),
     );
     expect(res.status).toBe(400);
     expect(await errorCode(res)).toBe('CLIENT_DISCONNECTED');
@@ -179,10 +186,10 @@ describe('limits', () => {
 describe('request validation', () => {
   it('requires the fingerprint header and a strict part number', async () => {
     const r = routes();
-    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: MIB, fingerprint: 'fp' }));
-    expect(await errorCode(await r.PUT(partRequest('a-bin', 1, new Uint8Array(MIB), null)))).toBe('INVALID_REQUEST');
+    const id = await beginId(r, { fileName: 'a.bin', totalBytes: MIB, fingerprint: 'fp' });
+    expect(await errorCode(await r.PUT(partRequest(id, 1, new Uint8Array(MIB), null)))).toBe('INVALID_REQUEST');
     for (const bad of ['1e3', '+1', '0x1', '1.0', '1234567']) {
-      const res = await r.PUT(partRequest('a-bin', bad, new Uint8Array(MIB)));
+      const res = await r.PUT(partRequest(id, bad, new Uint8Array(MIB)));
       expect(await errorCode(res), bad).toBe('PART_OUT_OF_RANGE');
     }
   });
@@ -190,9 +197,9 @@ describe('request validation', () => {
   it('passes a valid part checksum through, and refuses a malformed one', async () => {
     const r = routes();
     const bytes = patternBytes(MIB);
-    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: MIB, fingerprint: 'fp' }));
+    const id = await beginId(r, { fileName: 'a.bin', totalBytes: MIB, fingerprint: 'fp' });
     const put = (checksum: string) =>
-      r.PUT(new Request(`${BASE}/a-bin/parts/1`, { method: 'PUT', headers: { ...asUser, 'x-upload-fingerprint': 'fp', 'x-part-sha256': checksum }, body: bytes }));
+      r.PUT(new Request(`${BASE}/${id}/parts/1`, { method: 'PUT', headers: { ...asUser, 'x-upload-fingerprint': 'fp', 'x-part-sha256': checksum }, body: bytes }));
     expect(await errorCode(await put('NOT-HEX'))).toBe('INVALID_REQUEST');
     const mismatch = await put('0'.repeat(64));
     expect(mismatch.status).toBe(422);
@@ -244,9 +251,9 @@ describe('auth and routing', () => {
         throw new Error('secret database detail');
       },
     });
-    await r.POST(beginRequest({ fileName: 'a.bin', totalBytes: 5, fingerprint: 'fp' }));
-    await r.PUT(partRequest('a-bin', 1, patternBytes(5)));
-    const res = await r.POST(new Request(`${BASE}/a-bin/complete`, { method: 'POST', headers: asUser }));
+    const id = await beginId(r, { fileName: 'a.bin', totalBytes: 5, fingerprint: 'fp' });
+    await r.PUT(partRequest(id, 1, patternBytes(5)));
+    const res = await r.POST(new Request(`${BASE}/${id}/complete`, { method: 'POST', headers: asUser }));
     expect(res.status).toBe(500);
     expect(JSON.stringify(await res.json())).not.toContain('secret database detail');
     expect(onError).toHaveBeenCalledOnce();

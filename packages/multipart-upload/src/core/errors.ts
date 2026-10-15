@@ -37,6 +37,12 @@ export type UploadErrorCode =
   | 'TOO_MANY_PARTS'
   /** The file exceeds MULTIPART_UPLOAD_MAX_FILE_BYTES. */
   | 'FILE_TOO_LARGE'
+  /**
+   * The file's type is not in `allowedTypes` — refused at begin by its declared
+   * type or extension, or at complete because its CONTENT is a different type
+   * (e.g. an executable renamed to .png). On a content refusal the parts are kept.
+   */
+  | 'FILE_TYPE_NOT_ALLOWED'
   /** A request body (JSON or part) is larger than allowed. */
   | 'BODY_TOO_LARGE'
   /** Metadata exceeds the configured cap, or is not a JSON object. */
@@ -74,6 +80,7 @@ const STATUS_FOR_CODE: Record<UploadErrorCode, number> = {
   PART_IN_FLIGHT: 409,
   TOO_MANY_PARTS: 422,
   FILE_TOO_LARGE: 413,
+  FILE_TYPE_NOT_ALLOWED: 415,
   BODY_TOO_LARGE: 413,
   METADATA_TOO_LARGE: 413,
   INVALID_NAME: 400,

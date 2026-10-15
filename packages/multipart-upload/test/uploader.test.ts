@@ -8,6 +8,7 @@
 // never only on "it did not throw".
 // ---------------------------------------------------------------------------
 
+import { createHash } from 'node:crypto';
 import { readFile, readdir, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -66,41 +67,115 @@ describe('begin and resume', () => {
     const bytes = patternBytes(SIZE);
     const first = await up.begin(ALICE, { fileName: 'Mix.wav', totalBytes: SIZE, fingerprint: fingerprintOf(bytes, 'Mix.wav') });
     expect(first.created).toBe(true);
-    expect(first.session.manifest.uploadId).toBe('mix-wav');
+    const id = first.session.manifest.uploadId;
     expect(first.session.missingParts).toEqual([1, 2, 3, 4]);
 
-    await sendParts(up, ALICE, 'mix-wav', bytes, 'Mix.wav', [1, 2]);
+    await sendParts(up, ALICE, id, bytes, 'Mix.wav', [1, 2]);
 
     const again = await up.begin(ALICE, { fileName: 'Mix.wav', totalBytes: SIZE, fingerprint: fingerprintOf(bytes, 'Mix.wav') });
     expect(again.created).toBe(false);
+    expect(again.session.manifest.uploadId).toBe(id);
     expect(again.session.missingParts).toEqual([3, 4]);
     expect(again.session.receivedBytes).toBe(2 * MIB);
   });
 
-  it('REFUSES a different file under the same name, naming both', async () => {
+  it('names the upload and its temp folder by the SHA-256 of name, size, MIME type and fingerprint', async () => {
+    // Protects the identity contract: the folder is the hash of exactly these
+    // four fields, so a file differing in ANY of them gets its own folder.
     const up = uploaderWith();
-    await up.begin(ALICE, { fileName: 'song.mp3', totalBytes: SIZE, fingerprint: 'fp-one' });
-    const err = await up.begin(ALICE, { fileName: 'SONG.mp3', totalBytes: SIZE, fingerprint: 'fp-two' }).catch((e) => e);
-    expect(err).toBeInstanceOf(UploadError);
-    expect(err.code).toBe('NAME_IN_USE');
-    expect(err.message).toContain('song.mp3');
-    expect(err.message).toContain('SONG.mp3');
+    const begun = await up.begin(ALICE, { fileName: 'photo.png', totalBytes: SIZE, fingerprint: 'fp', contentType: 'image/png' });
+    const id = begun.session.manifest.uploadId;
+    const expected = createHash('sha256')
+      .update(JSON.stringify(['mpu-upload-v2', 'photo.png', SIZE, 'image/png', 'fp']))
+      .digest('hex');
+    expect(id).toBe(expected);
+    const folders = await readdir(join(root, '.parts', namespaceKeyFor(ALICE.namespace)));
+    expect(folders).toEqual([expected]); // the file name appears nowhere in the path
+    expect(begun.session.manifest).toMatchObject({ fileName: 'photo.png', totalBytes: SIZE, contentType: 'image/png', fingerprint: 'fp' });
   });
 
-  it('isolates namespaces: same file name, two users, two independent uploads', async () => {
-    // MUTATION: drop the namespace from the session key -> Bob's begin hits
-    // Alice's manifest and gets NAME_IN_USE.
+  it('gives a different upload to a file differing ONLY in size, MIME type, name or content', async () => {
+    // MUTATION: drop contentType from uploadIdFor -> the second begin resumes
+    // the first upload instead of starting its own.
     const up = uploaderWith();
-    const a = await up.begin(ALICE, { fileName: 'photo.jpg', totalBytes: SIZE, fingerprint: 'fp-alice' });
-    const b = await up.begin(BOB, { fileName: 'photo.jpg', totalBytes: SIZE + 1, fingerprint: 'fp-bob' });
+    const base = { fileName: 'photo.png', totalBytes: SIZE, fingerprint: 'fp', contentType: 'image/png' };
+    const ids = new Set<string>();
+    for (const variant of [
+      base,
+      { ...base, totalBytes: SIZE + 1 },
+      { ...base, contentType: 'image/jpeg' },
+      { ...base, fileName: 'photo2.png' },
+      { ...base, fingerprint: 'fp-other' },
+    ]) {
+      const begun = await up.begin(ALICE, variant);
+      expect(begun.created).toBe(true);
+      ids.add(begun.session.manifest.uploadId);
+    }
+    expect(ids.size).toBe(5);
+  });
+
+  it('keeps a different file with the same name as a separate upload, never mixing their parts', async () => {
+    const up = uploaderWith();
+    const one = patternBytes(SIZE, 1);
+    const a = await up.begin(ALICE, { fileName: 'song.mp3', totalBytes: SIZE, fingerprint: 'fp-one' });
+    for (const index of [1, 2]) {
+      await up.putPart(ALICE, { uploadId: a.session.manifest.uploadId, index, bytes: partOf(one, index, MIB), fingerprint: 'fp-one' });
+    }
+    const b = await up.begin(ALICE, { fileName: 'song.mp3', totalBytes: SIZE, fingerprint: 'fp-two' });
+    expect(b.created).toBe(true);
+    expect(b.session.manifest.uploadId).not.toBe(a.session.manifest.uploadId);
+    expect(b.session.missingParts).toEqual([1, 2, 3, 4]); // none of the first file's parts
+    expect((await up.status(ALICE, a.session.manifest.uploadId)).receivedBytes).toBe(2 * MIB);
+  });
+
+  it('REFUSES to resume onto a manifest that no longer describes the file, keeping its parts', async () => {
+    const up = uploaderWith();
+    const bytes = patternBytes(SIZE);
+    const fp = fingerprintOf(bytes, 'f.bin');
+    const begun = await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp });
+    const id = begun.session.manifest.uploadId;
+    await sendParts(up, ALICE, id, bytes, 'f.bin', [1]);
+    const path = join(root, sessionKey(namespaceKeyFor(ALICE.namespace), id), 'manifest.json');
+    const tampered = { ...JSON.parse(await readFile(path, 'utf8')), fingerprint: 'edited' };
+    await writeFile(path, JSON.stringify(tampered));
+    const err = await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp }).catch((e) => e);
+    expect(err).toBeInstanceOf(UploadError);
+    expect(err.code).toBe('NAME_IN_USE');
+    expect(err.message).toBe('The unfinished upload stored under this id does not describe "f.bin". Discard it and start again.');
+    // Nothing was reset: the part is still on disk.
+    const onDisk = await readdir(join(root, sessionKey(namespaceKeyFor(ALICE.namespace), id)));
+    expect(onDisk.filter((f) => f.endsWith('.part'))).toHaveLength(1);
+  });
+
+  it('isolates namespaces: the same file from two users is two independent uploads', async () => {
+    // Identical name, size and fingerprint -> identical upload id. Only the
+    // namespace separates them.
+    // MUTATION: drop the namespace from the session key -> Bob's begin resumes
+    // Alice's upload (created: false).
+    const up = uploaderWith();
+    const same = { fileName: 'photo.jpg', totalBytes: SIZE, fingerprint: 'fp-shared' };
+    const a = await up.begin(ALICE, same);
+    const b = await up.begin(BOB, same);
+    const id = a.session.manifest.uploadId;
+    expect(b.session.manifest.uploadId).toBe(id);
     expect(a.created && b.created).toBe(true);
-    expect(await codeOf(up.status(BOB, 'photo-jpg'))).toBe('resolved');
-    expect((await up.status(BOB, 'photo-jpg')).manifest.fingerprint).toBe('fp-bob');
     expect(await up.list(ALICE)).toHaveLength(1);
-    // Bob cannot discard or complete Alice's upload: his namespace has no such session after discarding his own.
-    await up.discard(BOB, 'photo-jpg');
-    expect(await codeOf(up.status(BOB, 'photo-jpg'))).toBe('NO_SESSION');
-    expect((await up.status(ALICE, 'photo-jpg')).manifest.fingerprint).toBe('fp-alice');
+    // Bob discarding his upload leaves Alice's untouched.
+    await up.discard(BOB, id);
+    expect(await codeOf(up.status(BOB, id))).toBe('NO_SESSION');
+    expect(await codeOf(up.status(ALICE, id))).toBe('resolved');
+  });
+
+  it('accepts a file name with no Latin letters, which the name-based id refused', async () => {
+    const up = uploaderWith();
+    const begun = await up.begin(ALICE, { fileName: '写真.png', totalBytes: 10, fingerprint: 'fp' });
+    expect(begun.created).toBe(true);
+    expect(begun.session.manifest.fileName).toBe('写真.png');
+  });
+
+  it('refuses a file name containing a control character', async () => {
+    const up = uploaderWith();
+    expect(await codeOf(up.begin(ALICE, { fileName: 'a\nb.png', totalBytes: 10, fingerprint: 'fp' }))).toBe('INVALID_NAME');
   });
 
   it('enforces the maximum size from .env before writing anything', async () => {
@@ -130,10 +205,18 @@ describe('begin and resume', () => {
     // change is rejected with PART_LENGTH_MISMATCH.
     const up = uploaderWith();
     const bytes = patternBytes(SIZE);
-    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fingerprintOf(bytes, 'f.bin') });
+    const begin = () => up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fingerprintOf(bytes, 'f.bin') });
+    const id = (await begin()).session.manifest.uploadId;
     process.env.MULTIPART_UPLOAD_PART_BYTES = String(2 * MIB);
-    await sendParts(up, ALICE, 'f-bin', bytes, 'f.bin', [1, 2, 3, 4]);
-    const done = await up.complete(ALICE, 'f-bin');
+    await sendParts(up, ALICE, id, bytes, 'f.bin', [1, 2]);
+    // Resuming after the change keeps the ORIGINAL part size, so the client
+    // slices the remaining parts on the boundaries already on disk.
+    const resumed = await begin();
+    expect(resumed.created).toBe(false);
+    expect(resumed.session.manifest.partBytes).toBe(MIB);
+    expect(resumed.session.missingParts).toEqual([3, 4]);
+    await sendParts(up, ALICE, id, bytes, 'f.bin', [3, 4]);
+    const done = await up.complete(ALICE, id);
     expect(done.sha256).toBe(sha256(bytes));
   });
 });
@@ -142,8 +225,8 @@ describe('parts', () => {
   it('is idempotent: re-sending a stored part succeeds as already present', async () => {
     const up = uploaderWith();
     const bytes = patternBytes(SIZE);
-    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fingerprintOf(bytes, 'f.bin') });
-    const part = { uploadId: 'f-bin', index: 1, bytes: partOf(bytes, 1, MIB), fingerprint: fingerprintOf(bytes, 'f.bin') };
+    const id = (await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fingerprintOf(bytes, 'f.bin') })).session.manifest.uploadId;
+    const part = { uploadId: id, index: 1, bytes: partOf(bytes, 1, MIB), fingerprint: fingerprintOf(bytes, 'f.bin') };
     expect((await up.putPart(ALICE, part)).alreadyPresent).toBe(false);
     expect((await up.putPart(ALICE, part)).alreadyPresent).toBe(true);
   });
@@ -152,44 +235,44 @@ describe('parts', () => {
     const up = uploaderWith();
     const bytes = patternBytes(SIZE);
     const fp = fingerprintOf(bytes, 'f.bin');
-    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp });
-    expect(await codeOf(up.putPart(ALICE, { uploadId: 'f-bin', index: 1, bytes: partOf(bytes, 1, MIB), fingerprint: 'other' }))).toBe('FINGERPRINT_MISMATCH');
-    expect(await codeOf(up.putPart(ALICE, { uploadId: 'f-bin', index: 5, bytes: partOf(bytes, 1, MIB), fingerprint: fp }))).toBe('PART_OUT_OF_RANGE');
-    expect(await codeOf(up.putPart(ALICE, { uploadId: 'f-bin', index: 1, bytes: partOf(bytes, 1, MIB).subarray(1), fingerprint: fp }))).toBe('PART_LENGTH_MISMATCH');
+    const id = (await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp })).session.manifest.uploadId;
+    expect(await codeOf(up.putPart(ALICE, { uploadId: id, index: 1, bytes: partOf(bytes, 1, MIB), fingerprint: 'other' }))).toBe('FINGERPRINT_MISMATCH');
+    expect(await codeOf(up.putPart(ALICE, { uploadId: id, index: 5, bytes: partOf(bytes, 1, MIB), fingerprint: fp }))).toBe('PART_OUT_OF_RANGE');
+    expect(await codeOf(up.putPart(ALICE, { uploadId: id, index: 1, bytes: partOf(bytes, 1, MIB).subarray(1), fingerprint: fp }))).toBe('PART_LENGTH_MISMATCH');
     // The short final part must be exactly its remainder.
-    expect(await codeOf(up.putPart(ALICE, { uploadId: 'f-bin', index: 4, bytes: partOf(bytes, 1, MIB), fingerprint: fp }))).toBe('PART_LENGTH_MISMATCH');
-    expect(await codeOf(up.putPart(BOB, { uploadId: 'f-bin', index: 1, bytes: partOf(bytes, 1, MIB), fingerprint: fp }))).toBe('NO_SESSION');
+    expect(await codeOf(up.putPart(ALICE, { uploadId: id, index: 4, bytes: partOf(bytes, 1, MIB), fingerprint: fp }))).toBe('PART_LENGTH_MISMATCH');
+    expect(await codeOf(up.putPart(BOB, { uploadId: id, index: 1, bytes: partOf(bytes, 1, MIB), fingerprint: fp }))).toBe('NO_SESSION');
   });
 
   it('verifies a part against the checksum sent with it, and stores nothing on a mismatch', async () => {
     const up = uploaderWith();
     const bytes = patternBytes(SIZE);
     const fp = fingerprintOf(bytes, 'f.bin');
-    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp });
+    const id = (await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp })).session.manifest.uploadId;
     const part2 = partOf(bytes, 2, MIB);
 
     // Right length, wrong content, true checksum of the intended bytes.
-    const wrong = await codeOf(up.putPart(ALICE, { uploadId: 'f-bin', index: 2, bytes: partOf(bytes, 1, MIB), fingerprint: fp, sha256: sha256(part2) }));
+    const wrong = await codeOf(up.putPart(ALICE, { uploadId: id, index: 2, bytes: partOf(bytes, 1, MIB), fingerprint: fp, sha256: sha256(part2) }));
     expect(wrong).toBe('PART_CHECKSUM_MISMATCH');
-    expect((await up.status(ALICE, 'f-bin')).missingParts).toContain(2); // nothing written
+    expect((await up.status(ALICE, id)).missingParts).toContain(2); // nothing written
 
-    const ok = await up.putPart(ALICE, { uploadId: 'f-bin', index: 2, bytes: part2, fingerprint: fp, sha256: sha256(part2) });
+    const ok = await up.putPart(ALICE, { uploadId: id, index: 2, bytes: part2, fingerprint: fp, sha256: sha256(part2) });
     expect(ok.alreadyPresent).toBe(false);
-    expect((await up.status(ALICE, 'f-bin')).missingParts).not.toContain(2);
+    expect((await up.status(ALICE, id)).missingParts).not.toContain(2);
   });
 
   it('lets exactly one of several concurrent writes of one part win, with correct bytes', async () => {
     const up = uploaderWith();
     const bytes = patternBytes(SIZE);
     const fp = fingerprintOf(bytes, 'f.bin');
-    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp });
+    const id = (await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp })).session.manifest.uploadId;
     const outcomes = await Promise.all(
-      Array.from({ length: 6 }, () => codeOf(up.putPart(ALICE, { uploadId: 'f-bin', index: 2, bytes: partOf(bytes, 2, MIB), fingerprint: fp }))),
+      Array.from({ length: 6 }, () => codeOf(up.putPart(ALICE, { uploadId: id, index: 2, bytes: partOf(bytes, 2, MIB), fingerprint: fp }))),
     );
     // Each attempt either succeeded or was told to retry — never anything else.
     expect(outcomes.every((o) => o === 'resolved' || o === 'PART_IN_FLIGHT')).toBe(true);
     expect(outcomes).toContain('resolved');
-    const stored = await readFile(join(root, partKey(namespaceKeyFor(ALICE.namespace), 'f-bin', 2, partTagFor(fp))));
+    const stored = await readFile(join(root, partKey(namespaceKeyFor(ALICE.namespace), id, 2, partTagFor(fp))));
     expect(sha256(new Uint8Array(stored))).toBe(sha256(partOf(bytes, 2, MIB)));
   });
 
@@ -197,21 +280,21 @@ describe('parts', () => {
     const up = uploaderWith();
     const bytes = patternBytes(SIZE);
     const fp = fingerprintOf(bytes, 'f.bin');
-    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp });
-    await sendParts(up, ALICE, 'f-bin', bytes, 'f.bin', [1, 2, 3, 4]);
+    const id = (await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fp })).session.manifest.uploadId;
+    await sendParts(up, ALICE, id, bytes, 'f.bin', [1, 2, 3, 4]);
     // Simulate a write that died half-way.
-    await writeFile(join(root, partKey(namespaceKeyFor(ALICE.namespace), 'f-bin', 3, partTagFor(fp))), partOf(bytes, 3, MIB).subarray(0, 1000));
-    expect((await up.status(ALICE, 'f-bin')).missingParts).toEqual([3]);
-    expect(await codeOf(up.complete(ALICE, 'f-bin'))).toBe('INCOMPLETE');
-    await sendParts(up, ALICE, 'f-bin', bytes, 'f.bin', [3]);
-    expect((await up.complete(ALICE, 'f-bin')).sha256).toBe(sha256(bytes));
+    await writeFile(join(root, partKey(namespaceKeyFor(ALICE.namespace), id, 3, partTagFor(fp))), partOf(bytes, 3, MIB).subarray(0, 1000));
+    expect((await up.status(ALICE, id)).missingParts).toEqual([3]);
+    expect(await codeOf(up.complete(ALICE, id))).toBe('INCOMPLETE');
+    await sendParts(up, ALICE, id, bytes, 'f.bin', [3]);
+    expect((await up.complete(ALICE, id)).sha256).toBe(sha256(bytes));
   });
 
   it('refuses a part on another instance', async () => {
     const up = uploaderWith();
-    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: 'fp' });
+    const id = (await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: 'fp' })).session.manifest.uploadId;
     process.env.MULTIPART_UPLOAD_INSTANCE_ID = 'node-b';
-    expect(await codeOf(up.putPart(ALICE, { uploadId: 'f-bin', index: 1, bytes: new Uint8Array(MIB), fingerprint: 'fp' }))).toBe('WRONG_INSTANCE');
+    expect(await codeOf(up.putPart(ALICE, { uploadId: id, index: 1, bytes: new Uint8Array(MIB), fingerprint: 'fp' }))).toBe('WRONG_INSTANCE');
   });
 });
 
@@ -289,9 +372,9 @@ describe('complete', () => {
   it('reports which parts are missing', async () => {
     const up = uploaderWith();
     const bytes = patternBytes(SIZE);
-    await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fingerprintOf(bytes, 'f.bin') });
-    await sendParts(up, ALICE, 'f-bin', bytes, 'f.bin', [1, 3]);
-    const err = await up.complete(ALICE, 'f-bin').catch((e) => e);
+    const id = (await up.begin(ALICE, { fileName: 'f.bin', totalBytes: SIZE, fingerprint: fingerprintOf(bytes, 'f.bin') })).session.manifest.uploadId;
+    await sendParts(up, ALICE, id, bytes, 'f.bin', [1, 3]);
+    const err = await up.complete(ALICE, id).catch((e) => e);
     expect(err.code).toBe('INCOMPLETE');
     expect(err.details).toEqual({ missingParts: [2, 4] });
   });
@@ -343,18 +426,19 @@ describe('sweep', () => {
     const up = uploaderWith();
     const ns = namespaceKeyFor(ALICE.namespace);
     const bytes = patternBytes(SIZE);
+    const ids: Record<string, string> = {};
     for (const name of ['old.bin', 'fresh.bin', 'paused.bin']) {
-      await up.begin(ALICE, { fileName: name, totalBytes: SIZE, fingerprint: fingerprintOf(bytes, name) });
+      ids[name] = (await up.begin(ALICE, { fileName: name, totalBytes: SIZE, fingerprint: fingerprintOf(bytes, name) })).session.manifest.uploadId;
     }
-    await age(join(root, sessionKey(ns, 'old-bin')), 2 * 3_600_000);
+    await age(join(root, sessionKey(ns, ids['old.bin'] as string)), 2 * 3_600_000);
     // Paused overnight: old manifest, but a part sent just now.
-    await age(join(root, sessionKey(ns, 'paused-bin')), 2 * 3_600_000);
-    await sendParts(up, ALICE, 'paused-bin', bytes, 'paused.bin', [1]);
+    await age(join(root, sessionKey(ns, ids['paused.bin'] as string)), 2 * 3_600_000);
+    await sendParts(up, ALICE, ids['paused.bin'] as string, bytes, 'paused.bin', [1]);
 
     const result = await up.sweep();
     expect(result.deleted).toBe(1);
     expect(result.freedBytes).toBeGreaterThan(0);
-    // MUTATION: use the manifest's age -> 'paused-bin' is reaped mid-flight.
-    expect((await up.list(ALICE)).map((s) => s.manifest.uploadId).sort()).toEqual(['fresh-bin', 'paused-bin']);
+    // MUTATION: use the manifest's age -> 'paused.bin' is reaped mid-flight.
+    expect((await up.list(ALICE)).map((s) => s.manifest.fileName).sort()).toEqual(['fresh.bin', 'paused.bin']);
   });
 });

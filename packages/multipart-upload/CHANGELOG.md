@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+
+- **`allowedTypes`** — restrict uploads by file type, as a parameter or `MULTIPART_UPLOAD_ALLOWED_TYPES` (comma-separated). Entries use the HTML `accept` syntax: `'image/png'`, `'image/*'`, `'.zip'`. Checked twice: by declared type and extension when the upload starts (refused before any byte is sent), and by the file's **actual content** before it is stored, so a renamed executable is refused. New error code `FILE_TYPE_NOT_ALLOWED` (415).
+- Content signatures for 30+ formats — images, PDF, Office, archives, audio, video and executables — exported as `detectFileType()`.
+- **`FILE_TYPES`** presets (`images`, `documents`, `pdf`, `spreadsheets`, `audio`, `video`, `archives`, …), exported from `/server` and `/client`.
+- `contentType` on the stored file (`onComplete`'s `file.contentType`) and on the client's result: the type verified from the content where the format has a signature.
+- `GET /api/uploads` returns `allowedTypes`, ready for `<input accept>`.
+- The client sends the browser's `File.type` when an upload begins.
+- README: a complete integration example, every setting with its `.env` fallback, the messages users see, a MIME type reference, and upgrade notes. Repository, homepage and issue links in `package.json`.
+
+### Changed
+
+- **Upload ids are now the SHA-256 of the file name, size, MIME type and content fingerprint** (64 hex characters), and name each upload's temporary folder. A file differing in any of these gets its own folder and can never share parts with another. File names no longer appear in folder names, and names with no Latin letters (`写真.png`) are accepted.
+- Two different files with the same name are now two separate uploads. Previously the second was refused with `NAME_IN_USE`; that code now means a stored manifest no longer matches its id.
+- Resuming after `partBytes` was changed continues on the part size frozen in the manifest instead of being refused.
+- `INVALID_NAME` now means the file name contains a control character.
+
+### Upgrading
+
+Unfinished uploads started on 0.1.x cannot be resumed after upgrading: the same file starts a new upload, and the sweep removes the old folders after `partTtlMs`. Finished files are unaffected.
+
 ## 0.1.0
 
 First release.

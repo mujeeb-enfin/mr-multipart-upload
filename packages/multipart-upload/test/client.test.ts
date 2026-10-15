@@ -60,7 +60,8 @@ describe('startUpload', () => {
     });
     const result = await handle.promise;
     expect(result.sha256).toBe(sha256(bytes));
-    expect(handle.uploadId).toBe('clip-mp4');
+    expect(handle.uploadId).toBe(result.uploadId);
+    expect(handle.uploadId).toMatch(/^[0-9a-f]{64}$/);
     const percents = seen.map((p) => p.percent);
     expect(percents.at(-1)).toBe(100);
     expect(seen.at(-1)?.phase).toBe('done');

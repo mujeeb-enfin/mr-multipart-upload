@@ -13,13 +13,14 @@ import { expectedPartBytes, partCountFor } from '../core/arithmetic.js';
 import { UploadError } from '../core/errors.js';
 import { describeByteSize } from '../core/format.js';
 import { lockKey, manifestKey, namespaceDirKey, partKey, sessionKey } from '../core/layout.js';
-import { type UploadManifest, type UploadMetadata, type UploadSession, manifestMatches, summariseSession } from '../core/session.js';
-import { assertSafeUploadId, uploadIdForFileName } from '../core/slug.js';
+import { type UploadManifest, type UploadMetadata, type UploadSession, summariseSession } from '../core/session.js';
+import { assertSafeUploadId } from '../core/slug.js';
 import type { StorageAdapter } from '../storage/adapter.js';
 import { FsStorage } from '../storage/fs-storage.js';
 import { completeUpload, DEFAULT_LOCK_STALE_MS, type CompleteHookInput, type CompleteResult } from './complete.js';
 import { type ConfigOverrides, type ResolvedConfig, resolveConfig } from './config.js';
-import { namespaceKeyFor, partTagFor } from './namespace.js';
+import { assertDeclaredTypeAllowed, declaredTypeFor } from './file-types.js';
+import { namespaceKeyFor, partTagFor, uploadIdFor } from './namespace.js';
 import { listVerifiedParts, readManifest, readSession, findSession, type StoreContext } from './store.js';
 import { sweepStaleUploads, type SweepResult } from './sweep.js';
 
@@ -66,6 +67,8 @@ export interface BeginInput {
   readonly totalBytes: number;
   readonly fingerprint: string;
   readonly metadata?: UploadMetadata;
+  /** The browser's `File.type`. Optional; the extension's usual type is used when absent. */
+  readonly contentType?: string;
 }
 
 export interface PutPartInput {
@@ -143,6 +146,11 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     if (typeof input.fileName !== 'string' || input.fileName.length === 0 || input.fileName.length > 1024) {
       throw new UploadError('INVALID_REQUEST', 'fileName must be a string of 1 to 1024 characters');
     }
+    // The name is stored and shown in messages, never used as a path, but a
+    // control character in it has no legitimate use.
+    if (/[\u0000-\u001f\u007f]/.test(input.fileName)) {
+      throw new UploadError('INVALID_NAME', 'fileName must not contain control characters');
+    }
     if (typeof input.fingerprint !== 'string' || !FINGERPRINT_PATTERN.test(input.fingerprint)) {
       throw new UploadError('INVALID_REQUEST', 'fingerprint must be 1–200 characters of [A-Za-z0-9._:-]');
     }
@@ -160,10 +168,20 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
         { maxFileBytes: config.maxFileBytes },
       );
     }
+    if (input.contentType !== undefined && (typeof input.contentType !== 'string' || input.contentType.length > 255)) {
+      throw new UploadError('INVALID_REQUEST', 'contentType must be a string of at most 255 characters');
+    }
+    // Check 1 of 2: refused here, before any part is sent. The content itself is
+    // checked at complete (see file-types.ts) — the declared type is only a name.
+    const contentType = declaredTypeFor(input.fileName, input.contentType);
+    assertDeclaredTypeAllowed(config.allowedTypes, input.fileName, contentType);
     const metadata = validateMetadata(input.metadata, maxMetadataBytes);
-    const uploadId = uploadIdForFileName(input.fileName);
+    // SHA-256 of name + size + MIME type + content fingerprint: the upload id and
+    // its temporary folder. Same file -> same folder (resume); any difference ->
+    // a different folder, so two files can never mix parts.
+    const identity = { fileName: input.fileName, totalBytes, contentType, fingerprint: input.fingerprint };
+    const uploadId = uploadIdFor(identity);
     const { partBytes } = config;
-    const candidate = { totalBytes, partBytes, fingerprint: input.fingerprint };
 
     if (options.sweepOnBegin !== false) {
       // Opportunistic and best-effort: a sweep problem must never block a new
@@ -172,13 +190,22 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     }
 
     const resume = async (existing: UploadManifest) => {
-      if (!manifestMatches(existing, candidate)) {
-        // REFUSE, never reset: silently discarding the first upload's parts would
-        // turn a naming collision into data loss.
+      // The id is a hash of exactly these fields, so they match unless the
+      // manifest was edited or written by an older version. REFUSE, never reset:
+      // discarding the existing parts would turn a mismatch into data loss.
+      // The part size is deliberately NOT compared: it is frozen in the manifest
+      // and the client slices by the value returned here, so a changed setting
+      // resumes safely on the original boundaries.
+      const sameFile =
+        existing.fileName === identity.fileName &&
+        existing.totalBytes === identity.totalBytes &&
+        existing.fingerprint === identity.fingerprint &&
+        (existing.contentType ?? contentType) === identity.contentType;
+      if (!sameFile) {
         throw new UploadError(
           'NAME_IN_USE',
-          `An unfinished upload of "${existing.fileName}" already uses this name, and it is a different ` +
-            `file from "${input.fileName}". Rename the file or discard the other upload first.`,
+          `The unfinished upload stored under this id does not describe "${input.fileName}". ` +
+            'Discard it and start again.',
           { uploadId },
         );
       }
@@ -207,6 +234,7 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       instanceId: config.instanceId,
       createdAt: new Date().toISOString(),
       metadata,
+      contentType,
     };
 
     const outcome = await store.storage.createExclusive(
@@ -218,7 +246,7 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       // resume path rather than overwriting someone else's session.
       const raced = await readManifest(store, uploadId);
       if (raced) return resume(raced);
-      throw new UploadError('NAME_IN_USE', 'Another upload claimed this name a moment ago. Retry.', { uploadId });
+      throw new UploadError('NAME_IN_USE', 'Another request is starting this upload right now. Retry.', { uploadId });
     }
     return { session: summariseSession(manifest, []), created: true };
   }
@@ -260,9 +288,10 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       }
     }
 
-    // Named with this upload's part tag, so an orphan of another file under the
-    // same name occupies a DIFFERENT key and can never satisfy the
-    // "already present" check below with the wrong bytes.
+    // Named with this upload's part tag, so a stray part file of anything else
+    // occupies a DIFFERENT key and can never satisfy the "already present"
+    // check below with the wrong bytes (a second line of defence: different
+    // files already get different session directories).
     const key = partKey(store.namespaceKey, uploadId, index, partTagFor(manifest.fingerprint));
     let alreadyPresent = false;
 

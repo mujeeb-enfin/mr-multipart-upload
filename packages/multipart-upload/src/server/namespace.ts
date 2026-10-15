@@ -40,6 +40,40 @@ export function partTagFor(fingerprint: string): string {
   return createHash('sha256').update(fingerprint, 'utf8').digest('hex').slice(0, 16);
 }
 
+/** What identifies one upload. Every field is bound into its id. */
+export interface UploadIdentity {
+  readonly fileName: string;
+  readonly totalBytes: number;
+  /** The declared MIME type (see file-types.ts `declaredTypeFor`). */
+  readonly contentType: string;
+  /** The client's content fingerprint: size, mtime, name and sampled bytes. */
+  readonly fingerprint: string;
+}
+
+/**
+ * The upload id, which is also the name of its temporary folder:
+ * `.parts/<namespace key>/<upload id>/`. The full SHA-256 (64 hex characters)
+ * of the file name, size, MIME type and content fingerprint.
+ *
+ * Derived, never random, so the same file resumes into the same folder after a
+ * reload or a restart. A file differing in ANY of those — even only its
+ * declared type — gets a different folder, so its parts can never merge with
+ * another file's. The file name does not appear in the folder name.
+ *
+ * Encoded as a JSON array so field boundaries are unambiguous: ("a", "bc") and
+ * ("ab", "c") cannot produce the same input.
+ */
+export function uploadIdFor(identity: UploadIdentity): string {
+  const encoded = JSON.stringify([
+    'mpu-upload-v2',
+    identity.fileName,
+    identity.totalBytes,
+    identity.contentType,
+    identity.fingerprint,
+  ]);
+  return createHash('sha256').update(encoded, 'utf8').digest('hex');
+}
+
 export function namespaceKeyFor(namespace: string): string {
   if (typeof namespace !== 'string' || namespace.length === 0) {
     throw new UploadError('UNAUTHORIZED', 'authorize() must return a non-empty namespace');

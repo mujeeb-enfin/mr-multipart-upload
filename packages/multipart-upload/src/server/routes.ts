@@ -208,6 +208,7 @@ export function createUploadRoutes(options: UploadRoutesOptions = {}): UploadRou
           totalBytes: body.totalBytes as number,
           fingerprint: body.fingerprint as string,
           metadata: body.metadata as never,
+          ...(body.contentType !== undefined ? { contentType: body.contentType as string } : {}),
         });
         return json(sessionView(session, uploader.config().maxFileBytes), created ? 201 : 200);
       }
@@ -218,10 +219,12 @@ export function createUploadRoutes(options: UploadRoutesOptions = {}): UploadRou
     }),
 
     GET: wrap(async (_request, segments, ctx) => {
-      const { maxFileBytes } = uploader.config();
+      const { maxFileBytes, allowedTypes } = uploader.config();
       if (segments.length === 0) {
         const sessions = await uploader.list(ctx);
-        return json({ uploads: sessions.map((s) => sessionView(s, maxFileBytes)), maxFileBytes });
+        // allowedTypes uses the `accept` attribute's syntax, so a page can pass
+        // it straight to <input type="file" accept={allowedTypes.join(',')}>.
+        return json({ uploads: sessions.map((s) => sessionView(s, maxFileBytes)), maxFileBytes, allowedTypes });
       }
       if (segments.length === 1) {
         return json(sessionView(await uploader.status(ctx, segments[0] as string), maxFileBytes));

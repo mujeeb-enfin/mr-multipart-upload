@@ -17,7 +17,7 @@ export type UploadMetadata = { [key: string]: JsonValue };
 
 export interface UploadManifest {
   readonly v: 1;
-  /** The derived session id — the slugified file name. */
+  /** The derived session id: sha256 of file name, size, MIME type and fingerprint. */
   readonly uploadId: string;
   /** Hashed namespace directory this session belongs to. */
   readonly namespaceKey: string;
@@ -41,6 +41,12 @@ export interface UploadManifest {
    * was approved when the upload started.
    */
   readonly metadata: UploadMetadata;
+  /**
+   * The DECLARED type at begin — the browser's File.type, or the extension's
+   * usual type. FROZEN like metadata. Absent in manifests written before 0.2.0;
+   * readers then derive it from the file name.
+   */
+  readonly contentType?: string;
 }
 
 export interface UploadSession {

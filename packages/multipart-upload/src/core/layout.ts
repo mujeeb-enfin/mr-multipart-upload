@@ -5,7 +5,8 @@
 // Every name is DERIVED:
 //
 //   namespace directory   sha256 of the caller's namespace (see namespace.ts)
-//   session directory     the file name, slugified (slug.ts)
+//   session directory     the upload id: sha256 of the file name, size, MIME
+//                         type and fingerprint (server/namespace.ts uploadIdFor)
 //   part file             its 1-based index, zero padded, plus the PART TAG
 //   manifest / staging / lock   fixed names
 //   final file            the sha256 of the assembled bytes
@@ -14,12 +15,13 @@
 // derived from the upload's fingerprint, e.g. `000002.3f9a1c07b2d4e816.part`.
 // Without it a part file's SIZE was the only evidence of its identity, and that
 // was not enough. A part write that was already in flight when its upload was
-// discarded could land afterwards, leaving an orphan. A DIFFERENT file uploaded
-// later under the same name then found a correctly-sized `000002.part`, treated
-// it as already received, and assembled the old file's bytes into the new one —
-// reported as a success. With the tag, the orphan has a different name from
-// anything the new upload reads or writes, so it is never counted, never reused,
-// and `complete` deletes it.
+// discarded could land afterwards, leaving an orphan. When session directories
+// were named after the file (before 0.2.0), a DIFFERENT file uploaded later
+// under the same name then found a correctly-sized `000002.part`, treated it as
+// already received, and assembled the old file's bytes into the new one —
+// reported as a success. Since 0.2.0 that second file has its own directory (the
+// id hashes the fingerprint too); the tag remains as a second line of defence,
+// so any stray part is never counted, never reused, and `complete` deletes it.
 //
 // That is a constraint, not an aesthetic. A random component anywhere in a
 // resumable upload has to be PERSISTED to be useful on the next attempt, and
