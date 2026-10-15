@@ -19,7 +19,15 @@
 // UNKNOWNs: none.
 // ---------------------------------------------------------------------------
 
-import { E2E_MAX_FILE_BYTES, E2E_PART_BYTES } from '../playwright.config';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { DEMO_ALLOWED_TYPES, DEMO_MAX_FILE_BYTES, DEMO_PART_BYTES } from '../app/upload-settings';
+
+// The demo's values, set in code. The server also runs with CONFLICTING .env
+// values (playwright.config.ts), so these passing proves code wins over .env.
+const E2E_MAX_FILE_BYTES = DEMO_MAX_FILE_BYTES;
+const E2E_PART_BYTES = DEMO_PART_BYTES;
 import { FIXTURES, sha256OfFixture } from './fixtures';
 import { COMPLETE_POST, PART_PUT, holdPartsAfter, trackPartsInFlight, uploaderPage } from './page-model';
 import { expect, test } from './test';
@@ -210,7 +218,9 @@ test.describe('discarding', () => {
 });
 
 test.describe('refusals', () => {
-  test('a different file with the same name is refused, not merged into the first', async ({ page }) => {
+  test('a different file with the same name is a separate upload, never merged into the first', async ({ page }) => {
+    // Each upload's folder is the SHA-256 of its name, size, type and content
+    // fingerprint, so a second "report.pdf" gets its own folder.
     const ui = uploaderPage(page);
     const parts = await holdPartsAfter(page, 2);
     await ui.open();
@@ -221,12 +231,18 @@ test.describe('refusals', () => {
     await expect(ui.status).toContainText('Paused');
     await parts.release();
 
+    // The other file starts fresh — none of the first file's parts are reused —
+    // and stores exactly its own bytes.
     await ui.pick('clashOther');
     await ui.uploadButton.click();
-    await expect(ui.error).toContainText('already uses this name');
-    await expect(ui.status).toContainText('Upload failed');
+    await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
+    await expect(ui.resumed).toHaveCount(0);
+    await expect(ui.sha256).toHaveText(sha256OfFixture('clashOther'));
 
-    // The first file is untouched and still resumes to its own exact bytes.
+    // The first file is untouched: still 2 parts on the server, and it resumes
+    // to its own exact bytes.
+    const first = (await ui.uploadsOnServer()).find((u) => u.fileName === FIXTURES.clash.name);
+    expect(first?.receivedBytes).toBe(2 * E2E_PART_BYTES);
     await ui.pick('clash');
     await ui.uploadButton.click();
     await expect(ui.resumed).toBeVisible();
@@ -240,16 +256,79 @@ test.describe('refusals', () => {
     page.on('request', (req) => PART_PUT.test(req.url()) && (partRequests += 1));
 
     await ui.open();
-    await expect(ui.maxSize).toContainText('40 MB');
+    // 500 MB from the code, not the 40 MB the server's .env says.
+    await expect(ui.maxSize).toHaveText('Maximum upload size: 500 MB (set by maxFileBytes in the upload route)');
     await ui.pick('tooBig');
     await ui.uploadButton.click();
 
     // The exact message the person reads: readable sizes, exact bytes kept.
-    expect(FIXTURES.tooBig.size).toBe(42_991_616);
-    expect(E2E_MAX_FILE_BYTES).toBe(41_943_040);
+    expect(FIXTURES.tooBig.size).toBe(525_336_576);
+    expect(E2E_MAX_FILE_BYTES).toBe(524_288_000);
     await expect(ui.error).toHaveText(
-      'This file is 41 MB (42,991,616 bytes); the maximum upload size is 40 MB (41,943,040 bytes).',
+      'This file is 501 MB (525,336,576 bytes); the maximum upload size is 500 MB (524,288,000 bytes).',
     );
+    await expect(ui.status).toContainText('Upload failed');
+    expect(partRequests).toBe(0);
+  });
+});
+
+test.describe('allowed file types', () => {
+  // The demo's list, set in code in app/upload-settings.ts.
+  const allowedList = DEMO_ALLOWED_TYPES.join(', ');
+
+  test('.env.example lists the same allowed types as the code', () => {
+    // Protects the documentation: a reader copying .env.example must get the
+    // list the demo actually runs with, not a stale one.
+    const line = readFileSync(join(process.cwd(), '.env.example'), 'utf8')
+      .split('\n')
+      .find((l) => l.startsWith('MULTIPART_UPLOAD_ALLOWED_TYPES='));
+    expect(line?.slice('MULTIPART_UPLOAD_ALLOWED_TYPES='.length).trim().split(',')).toEqual([...DEMO_ALLOWED_TYPES]);
+  });
+
+  test("the picker and the hint show the server's allowed types", async ({ page }) => {
+    const ui = uploaderPage(page);
+    await ui.open();
+    expect(DEMO_ALLOWED_TYPES).toEqual(['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/*', 'audio/*', 'application/pdf', '.zip']);
+    await expect(ui.allowedTypes).toHaveText(`Allowed types: ${allowedList} (set by allowedTypes in the upload route)`);
+    await expect(ui.fileInput).toHaveAttribute('accept', DEMO_ALLOWED_TYPES.join(','));
+  });
+
+  test('stores a real image and shows the type verified from its content', async ({ page }) => {
+    const ui = uploaderPage(page);
+    await ui.open();
+    await ui.pick('photo');
+    await ui.uploadButton.click();
+    await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
+    await expect(ui.contentType).toHaveText('image/png');
+    await expect(ui.sha256).toHaveText(sha256OfFixture('photo'));
+  });
+
+  test('refuses an executable renamed to .png by its content, storing nothing', async ({ page }) => {
+    // The browser reports "holiday.png" as image/png, so the first check passes
+    // and every part is sent; the content check before storing refuses it.
+    const ui = uploaderPage(page);
+    await ui.open();
+    await ui.pick('disguisedExe');
+    await ui.uploadButton.click();
+    await expect(ui.error).toHaveText(
+      `"holiday.png" was refused: its content is a Windows executable, not image/png. Allowed types: ${allowedList}.`,
+      { timeout: 60_000 },
+    );
+    await expect(ui.status).toContainText('Upload failed');
+    await expect(ui.result).toHaveCount(0);
+    // Nothing stored; the parts are kept for the sweep, as documented.
+    const held = (await ui.uploadsOnServer()).find((u) => u.fileName === FIXTURES.disguisedExe.name);
+    expect(held?.receivedBytes).toBe(FIXTURES.disguisedExe.size);
+  });
+
+  test('refuses a disallowed type before sending any part', async ({ page }) => {
+    const ui = uploaderPage(page);
+    let partRequests = 0;
+    page.on('request', (req) => PART_PUT.test(req.url()) && (partRequests += 1));
+    await ui.open();
+    await ui.pick('notes');
+    await ui.uploadButton.click();
+    await expect(ui.error).toHaveText(`"notes.txt" is not an allowed file type (text/plain). Allowed types: ${allowedList}.`);
     await expect(ui.status).toContainText('Upload failed');
     expect(partRequests).toBe(0);
   });

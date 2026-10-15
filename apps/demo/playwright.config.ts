@@ -4,10 +4,15 @@ import { defineConfig, devices } from '@playwright/test';
 
 const PORT = 3100;
 
-// The limits the e2e suite asserts against. Set here, on the server process,
-// exactly as an operator would set them in .env.
-export const E2E_MAX_FILE_BYTES = 40 * 1024 * 1024;
-export const E2E_PART_BYTES = 1024 * 1024;
+// The demo sets maxFileBytes, partBytes and allowedTypes IN CODE
+// (app/upload-settings.ts); the suite asserts against those values. The server
+// is ALSO given CONFLICTING .env values below, so every test that passes proves
+// that a setting in code wins over its .env variable.
+const CONFLICTING_ENV = {
+  MULTIPART_UPLOAD_MAX_FILE_BYTES: String(40 * 1024 * 1024),
+  MULTIPART_UPLOAD_PART_BYTES: String(1024 * 1024),
+  MULTIPART_UPLOAD_ALLOWED_TYPES: 'text/plain',
+};
 
 /** The server's combined output, read per test by the shared fixture (e2e/test.ts). */
 export const SERVER_LOG = join(process.cwd(), 'e2e', '.server-log', 'server.log');
@@ -36,7 +41,15 @@ export default defineConfig({
   // platform records one; every later run compares against it.
   updateSnapshots: 'missing',
   snapshotPathTemplate: `{testDir}/__screenshots__/{testFilePath}/{arg}-{projectName}-{platform}-${RENDER_MODE}{ext}`,
-  expect: { toHaveScreenshot: { maxDiffPixelRatio: 0.01, animations: 'disabled' } },
+  expect: {
+    // 15 s, not the 5 s default. Most assertions wait on a server round trip
+    // plus a React render. On a loaded machine (measured: CPU at 100%), a run
+    // failed with the server answering in 16 ms while Playwright's own 5 s
+    // expect took 8.8 s to time out — the runner, not the app, was starved.
+    // A longer wait only delays reporting a real failure; it cannot pass one.
+    timeout: 15_000,
+    toHaveScreenshot: { maxDiffPixelRatio: 0.01, animations: 'disabled' },
+  },
   use: {
     baseURL: `http://localhost:${PORT}`,
     trace: 'retain-on-failure',
@@ -58,8 +71,7 @@ export default defineConfig({
     env: {
       MPU_PORT: String(PORT),
       MPU_SERVER_LOG: SERVER_LOG,
-      MULTIPART_UPLOAD_MAX_FILE_BYTES: String(E2E_MAX_FILE_BYTES),
-      MULTIPART_UPLOAD_PART_BYTES: String(E2E_PART_BYTES),
+      ...CONFLICTING_ENV,
       MULTIPART_UPLOAD_DIR: './e2e/.fixtures/store',
     },
   },

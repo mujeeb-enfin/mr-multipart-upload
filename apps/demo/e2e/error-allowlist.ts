@@ -44,10 +44,17 @@ export const ALLOWED_ERRORS: Readonly<Record<string, AllowedErrors>> = {
     reason: 'The test pauses before discarding, which aborts the part requests in flight.',
     abortedRequests: PART_REQUEST,
   },
-  'a different file with the same name is refused, not merged into the first': {
-    reason: 'The server must answer 409 NAME_IN_USE; pausing first aborts in-flight parts.',
-    statuses: [409],
+  'a different file with the same name is a separate upload, never merged into the first': {
+    reason: 'The test pauses the first file, which aborts the part requests in flight.',
     abortedRequests: PART_REQUEST,
+  },
+  'refuses an executable renamed to .png by its content, storing nothing': {
+    reason: 'The server must answer 415 FILE_TYPE_NOT_ALLOWED at complete; that is the behaviour under test.',
+    statuses: [415],
+  },
+  'refuses a disallowed type before sending any part': {
+    reason: 'The server must answer 415 FILE_TYPE_NOT_ALLOWED at begin; that is the behaviour under test.',
+    statuses: [415],
   },
   'refuses a file over MULTIPART_UPLOAD_MAX_FILE_BYTES without sending any part': {
     reason: 'The server must answer 413 FILE_TOO_LARGE; that is the behaviour under test.',

@@ -42,6 +42,9 @@ export function uploaderPage(page: Page) {
     resumed: card.getByTestId('resumed'),
     unfinished: card.getByTestId('unfinished'),
     maxSize: card.getByTestId('max-size'),
+    allowedTypes: card.getByTestId('allowed-types'),
+    contentType: card.getByTestId('content-type'),
+    result: card.getByTestId('result'),
 
     async open(): Promise<void> {
       await page.goto('/');
