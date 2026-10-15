@@ -38,14 +38,17 @@ export function Uploader() {
   const upload = useMultipartUpload({ endpoint: '/api/uploads' });
   const [file, setFile] = useState<File | null>(null);
   const [maxFileBytes, setMaxFileBytes] = useState<number | null>(null);
+  // From the server, in `accept` syntax. Empty: every type is allowed.
+  const [allowedTypes, setAllowedTypes] = useState<string[]>([]);
   const [unfinished, setUnfinished] = useState<Unfinished[]>([]);
 
   const refresh = useCallback(async () => {
     const res = await fetch('/api/uploads', { cache: 'no-store' });
     if (!res.ok) return;
-    const body = (await res.json()) as { uploads: Unfinished[]; maxFileBytes: number };
+    const body = (await res.json()) as { uploads: Unfinished[]; maxFileBytes: number; allowedTypes?: string[] };
     setUnfinished(body.uploads);
     setMaxFileBytes(body.maxFileBytes);
+    setAllowedTypes(body.allowedTypes ?? []);
   }, []);
 
   useEffect(() => {
@@ -83,6 +86,8 @@ export function Uploader() {
         <input
           data-testid="file-input"
           type="file"
+          // Only narrows the picker's view; the server checks type and content.
+          accept={allowedTypes.length > 0 ? allowedTypes.join(',') : undefined}
           disabled={busy}
           onChange={(e) => {
             setFile(e.target.files?.[0] ?? null);
@@ -92,7 +97,12 @@ export function Uploader() {
       </label>
       {maxFileBytes !== null && (
         <p className="hint" data-testid="max-size">
-          Maximum upload size: {formatBytes(maxFileBytes)} (set by MULTIPART_UPLOAD_MAX_FILE_BYTES)
+          Maximum upload size: {formatBytes(maxFileBytes)} (set by maxFileBytes in the upload route)
+        </p>
+      )}
+      {allowedTypes.length > 0 && (
+        <p className="hint" data-testid="allowed-types">
+          Allowed types: {allowedTypes.join(', ')} (set by allowedTypes in the upload route)
         </p>
       )}
 
@@ -147,6 +157,10 @@ export function Uploader() {
           <dd>{upload.result.fileName}</dd>
           <dt>Size</dt>
           <dd>{formatBytes(upload.result.size)}</dd>
+          <dt>Type</dt>
+          <dd className="mono" data-testid="content-type">
+            {upload.result.contentType}
+          </dd>
           <dt>SHA-256</dt>
           <dd className="mono" data-testid="sha256">
             {upload.result.sha256}
