@@ -52,6 +52,20 @@ function parseRetryAfter(value: string | null): number | null {
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
 }
 
+/**
+ * Retry-After from an XHR, read from getAllResponseHeaders(). getResponseHeader()
+ * on a cross-origin response (direct transfer to S3 / Azure) that does not
+ * expose the header logs "Refused to get unsafe header" in Chromium on every
+ * part; the full list holds only exposed headers and never logs.
+ */
+function retryAfterOf(xhr: XMLHttpRequest): string | null {
+  for (const line of xhr.getAllResponseHeaders().split(/\r?\n/)) {
+    const colon = line.indexOf(':');
+    if (colon > 0 && line.slice(0, colon).trim().toLowerCase() === 'retry-after') return line.slice(colon + 1).trim();
+  }
+  return null;
+}
+
 export const xhrPartSender: PartSender = (request) =>
   new Promise<PartResponse>((resolve, reject) => {
     if (request.signal.aborted) {
@@ -73,7 +87,7 @@ export const xhrPartSender: PartSender = (request) =>
       } catch {
         body = null;
       }
-      resolve({ status: xhr.status, body, retryAfterSeconds: parseRetryAfter(xhr.getResponseHeader('retry-after')) });
+      resolve({ status: xhr.status, body, retryAfterSeconds: parseRetryAfter(retryAfterOf(xhr)) });
     });
     xhr.addEventListener('error', () =>
       reject(new UploadClientError('The part could not reach the server.', 0, 'NETWORK')),
@@ -104,7 +118,20 @@ export function fetchPartSender(fetchImpl: typeof fetch = fetch): PartSender {
         'NETWORK',
       );
     }
-    const text = await response.text();
+    // The body is read under the same rules as the request: a pause that lands
+    // after the part was accepted but before its body arrives is a PAUSE, not a
+    // network failure. (Found by a test that pauses between the two; it failed
+    // the upload with NETWORK instead of pausing it.) A successful part whose
+    // body cannot be read is still stored — its status says so.
+    let text = '';
+    try {
+      text = await response.text();
+    } catch (err) {
+      if (request.signal.aborted) throw pausedError();
+      if (!response.ok) {
+        throw new UploadClientError(err instanceof Error ? err.message : 'The response was cut off.', 0, 'NETWORK');
+      }
+    }
     let body: unknown = null;
     try {
       body = text ? JSON.parse(text) : null;
