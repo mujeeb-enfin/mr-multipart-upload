@@ -25,6 +25,12 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`;
 }
 
+function checksumLabel(result: { sha256: string; checksum: { type: string; parts?: number } | null }): string {
+  if (result.sha256) return 'SHA-256';
+  if (result.checksum?.type === 'sha256-composite') return `Composite SHA-256 (${result.checksum.parts} parts)`;
+  return 'Checksum';
+}
+
 const STATUS_LABEL = {
   idle: 'Ready',
   uploading: 'Uploading',
@@ -161,9 +167,12 @@ export function Uploader() {
           <dd className="mono" data-testid="content-type">
             {upload.result.contentType}
           </dd>
-          <dt>SHA-256</dt>
+          {/* Local storage: the exact SHA-256 of the stored file. Cloud storage
+              (S3, MinIO, Azure) cannot compute one for a multipart file, so it
+              shows the composite SHA-256 — or that none was verified. */}
+          <dt>{checksumLabel(upload.result)}</dt>
           <dd className="mono" data-testid="sha256">
-            {upload.result.sha256}
+            {upload.result.sha256 || upload.result.checksum?.value || 'not verified by this storage'}
           </dd>
           <dt>Stored as</dt>
           <dd className="mono">{upload.result.key}</dd>

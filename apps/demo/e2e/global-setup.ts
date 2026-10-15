@@ -3,9 +3,11 @@ import { dirname } from 'node:path';
 
 import { detectFileType } from '@mr_innovations/multipart-upload/server';
 
+import { prepareCloudStorage } from './cloud-setup';
 import { FIXTURES, FIXTURE_DIR, type FixtureKey, fixtureBytes, fixturePath } from './fixtures';
 
-export default function globalSetup(): void {
+export default async function globalSetup(): Promise<void> {
+  await prepareCloudStorage('http://localhost:3100');
   // A clean store each run, so a resume is only ever a resume of THIS run.
   rmSync(FIXTURE_DIR, { recursive: true, force: true });
   (Object.keys(FIXTURES) as FixtureKey[]).forEach((key, i) => {

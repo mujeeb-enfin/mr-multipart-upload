@@ -22,8 +22,32 @@ import type { Page } from '@playwright/test';
 
 import { type FixtureKey, fixturePath } from './fixtures';
 
-export const PART_PUT = /\/api\/uploads\/[^/]+\/parts\/\d+$/;
+/**
+ * A part upload, in every transfer mode:
+ *   proxy           PUT /api/uploads/<id>/parts/<n>
+ *   direct, S3      PUT <bucket>/<key>?…partNumber=<n>…   (presigned)
+ *   direct, Azure   PUT <container>/<blob>?comp=block&blockid=…   (SAS)
+ */
+export const PART_PUT = /\/api\/uploads\/[^/]+\/parts\/\d+$|[?&]partNumber=\d+(&|$)|[?&]comp=block(&|$)/;
 export const COMPLETE_POST = /\/api\/uploads\/[^/]+\/complete$/;
+
+/** The 1-based part number a part-upload URL is for, in every transfer mode. */
+export function partIndexOf(url: string): number {
+  const parsed = new URL(url);
+  const partNumber = parsed.searchParams.get('partNumber');
+  if (partNumber) return Number(partNumber);
+  const blockId = parsed.searchParams.get('blockid');
+  // Azure block ids are base64(4-byte big-endian part index ‖ part SHA-256).
+  if (blockId) return Buffer.from(blockId, 'base64').readUInt32BE(0);
+  return Number(parsed.pathname.split('/').at(-1));
+}
+
+/**
+ * Headers for a response the test fakes in place of the storage. A direct
+ * part goes to another origin, so without CORS headers the browser would
+ * hide the fake status and the client would see a network error instead.
+ */
+export const FAKE_RESPONSE_CORS = { 'access-control-allow-origin': '*', 'access-control-expose-headers': '*' };
 
 export function uploaderPage(page: Page) {
   // Scoped to the card: Next.js's route announcer also has role="alert".

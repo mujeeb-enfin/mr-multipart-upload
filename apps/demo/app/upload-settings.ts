@@ -16,8 +16,12 @@ const MB = 1024 * 1024;
 /** 1. Largest file accepted, in bytes. Package default: 500 MB. */
 export const DEMO_MAX_FILE_BYTES = 500 * MB;
 
-/** 2. Size of each uploaded part, in bytes, between 1 MB and 8 MB. Package default: 2 MB. */
-export const DEMO_PART_BYTES = 2 * MB;
+/**
+ * 2. Size of each uploaded part, in bytes, between 1 MB and 8 MB. Package
+ * default: 2 MB. The demo uses 5 MB — S3's minimum part size — so the same
+ * settings work on every storage: local, aws_s3, minio and azure_blob.
+ */
+export const DEMO_PART_BYTES = 5 * MB;
 
 /**
  * 3. File types accepted. One example of each kind of entry:

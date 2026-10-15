@@ -8,7 +8,7 @@
 // also scanned with axe by the shared fixture.
 // ---------------------------------------------------------------------------
 
-import { fixturePath, sha256OfFixture } from './fixtures';
+import { fixturePath, storedChecksumOf } from './fixtures';
 import { uploaderPage } from './page-model';
 import { expect, test } from './test';
 
@@ -34,7 +34,7 @@ test.describe('accessibility', () => {
 
     await page.keyboard.press('Enter');
     await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
-    await expect(ui.sha256).toHaveText(sha256OfFixture('small'));
+    await expect(ui.sha256).toHaveText(storedChecksumOf('small'));
   });
 
   test('shows the error state accessibly', async ({ page }) => {

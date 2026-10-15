@@ -14,7 +14,7 @@
 // it failed too. A fresh context per width is also closer to a real device.
 // ---------------------------------------------------------------------------
 
-import { sha256OfFixture } from './fixtures';
+import { storedChecksumOf } from './fixtures';
 import { uploaderPage } from './page-model';
 import { expect, test } from './test';
 
@@ -51,7 +51,7 @@ for (const viewport of VIEWPORTS) {
 
       await ui.uploadButton.click();
       await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
-      await expect(ui.sha256).toHaveText(sha256OfFixture('small'));
+      await expect(ui.sha256).toHaveText(storedChecksumOf('small'));
     });
   });
 }

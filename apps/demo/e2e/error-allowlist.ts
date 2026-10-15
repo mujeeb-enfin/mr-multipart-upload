@@ -25,7 +25,11 @@ export interface AllowedErrors {
 }
 
 /** Part uploads, which pause and discard abort mid-flight. */
-const PART_REQUEST = /\/api\/uploads\/[^/]+\/parts\/\d+$/;
+/**
+ * Part requests in every transfer mode: the proxy PUT, the direct-transfer
+ * signing request (/parts/<n>/url), and the direct PUT to S3 or Azure.
+ */
+const PART_REQUEST = /\/api\/uploads\/[^/]+\/parts\/\d+(\/url)?$|[?&]partNumber=\d+(&|$)|[?&]comp=block(&|$)/;
 
 export const ALLOWED_ERRORS: Readonly<Record<string, AllowedErrors>> = {
   'resumes after a pause and a page reload, sending only the missing parts': {

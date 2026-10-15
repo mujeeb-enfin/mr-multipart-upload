@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { DEMO_PART_BYTES } from '../app/upload-settings';
+
 export const FIXTURE_DIR = join(process.cwd(), 'e2e', '.fixtures');
 export const MIB = 1024 * 1024;
 
@@ -35,15 +37,21 @@ interface Fixture {
 
 export const FIXTURES = {
   small: { name: 'small-clip.mp4', size: 6 * MIB + 123, dir: '', signature: MP4_SIGNATURE },
-  resumable: { name: 'long-recording.mp4', size: 30 * MIB + 777, dir: '', signature: MP4_SIGNATURE }, // 16 parts at 2 MiB
-  // 1 MB over the demo's 500 MB limit (app/upload-settings.ts).
+  // Part counts are at the demo's 5 MiB parts (app/upload-settings.ts).
+  resumable: { name: 'long-recording.mp4', size: 30 * MIB + 777, dir: '', signature: MP4_SIGNATURE }, // 7 parts
+  // 1 MB over the demo's 500 MB limit.
   tooBig: { name: 'too-big.mp4', size: 501 * MIB, dir: '', signature: MP4_SIGNATURE, extendTo: true },
-  retried: { name: 'flaky-network.mp4', size: 8 * MIB + 5, dir: '', signature: MP4_SIGNATURE },
-  discarded: { name: 'changed-my-mind.mp4', size: 20 * MIB, dir: '', signature: MP4_SIGNATURE },
+  // 5 parts: the retry test injects failures on parts 2 and 5.
+  retried: { name: 'flaky-network.mp4', size: 21 * MIB + 5, dir: '', signature: MP4_SIGNATURE },
+  discarded: { name: 'changed-my-mind.mp4', size: 20 * MIB, dir: '', signature: MP4_SIGNATURE }, // 4 parts
   // Same NAME as `clash`, different bytes — a second file the user happens to
   // have named identically. Kept in a subdirectory so both exist on disk.
-  clash: { name: 'report.pdf', size: 10 * MIB, dir: '', signature: PDF_SIGNATURE },
-  clashOther: { name: 'report.pdf', size: 10 * MIB, dir: 'other', signature: PDF_SIGNATURE },
+  // EXACTLY 3 full parts: the test holds the upload after "the first two parts
+  // that reach the server", and with concurrent sends a short last part hashes
+  // faster and can be one of them — every part must be the same size for
+  // "two parts" to mean a known byte count.
+  clash: { name: 'report.pdf', size: 15 * MIB, dir: '', signature: PDF_SIGNATURE },
+  clashOther: { name: 'report.pdf', size: 15 * MIB, dir: 'other', signature: PDF_SIGNATURE },
   // allowedTypes (the demo's, app/upload-settings.ts): a genuine image, an
   // executable renamed to .png, and a type that is not allowed at all.
   photo: { name: 'holiday-photo.png', size: 3 * MIB + 11, dir: '', signature: PNG_SIGNATURE },
@@ -71,6 +79,32 @@ export function fixturePath(key: FixtureKey): string {
 
 export function sha256OfFixture(key: FixtureKey): string {
   return createHash('sha256').update(readFileSync(fixturePath(key))).digest('hex');
+}
+
+/** The storage this run uses — the same variables the demo's server reads. */
+export const E2E_STORAGE = process.env.MULTIPART_UPLOAD_STORAGE ?? 'local';
+export const E2E_TRANSFER = process.env.MULTIPART_UPLOAD_TRANSFER ?? 'proxy';
+
+/**
+ * What the page must show for a stored fixture, computed independently of the
+ * library. Local storage: the exact SHA-256. Cloud storage: the composite
+ * SHA-256 (SHA-256 of each part's SHA-256) at the demo's part size. Azure with
+ * direct transfer verifies only MD5, so no checksum is claimed.
+ */
+export function expectedChecksumOfFixture(key: FixtureKey, partBytes: number): string {
+  if (E2E_STORAGE === 'local') return sha256OfFixture(key);
+  if (E2E_STORAGE === 'azure_blob' && E2E_TRANSFER === 'direct') return 'not verified by this storage';
+  const bytes = readFileSync(fixturePath(key));
+  const outer = createHash('sha256');
+  for (let start = 0; start < bytes.byteLength; start += partBytes) {
+    outer.update(createHash('sha256').update(bytes.subarray(start, Math.min(start + partBytes, bytes.byteLength))).digest());
+  }
+  return outer.digest('hex');
+}
+
+/** The checksum the page shows for a stored fixture, at the demo's part size. */
+export function storedChecksumOf(key: FixtureKey): string {
+  return expectedChecksumOfFixture(key, DEMO_PART_BYTES);
 }
 
 /** Offset-dependent bytes, so a misplaced or missing part changes the hash. */

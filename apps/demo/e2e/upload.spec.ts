@@ -28,8 +28,8 @@ import { DEMO_ALLOWED_TYPES, DEMO_MAX_FILE_BYTES, DEMO_PART_BYTES } from '../app
 // values (playwright.config.ts), so these passing proves code wins over .env.
 const E2E_MAX_FILE_BYTES = DEMO_MAX_FILE_BYTES;
 const E2E_PART_BYTES = DEMO_PART_BYTES;
-import { FIXTURES, sha256OfFixture } from './fixtures';
-import { COMPLETE_POST, PART_PUT, holdPartsAfter, trackPartsInFlight, uploaderPage } from './page-model';
+import { E2E_TRANSFER, FIXTURES, storedChecksumOf } from './fixtures';
+import { COMPLETE_POST, FAKE_RESPONSE_CORS, PART_PUT, holdPartsAfter, partIndexOf, trackPartsInFlight, uploaderPage } from './page-model';
 import { expect, test } from './test';
 
 test.describe('uploading', () => {
@@ -58,7 +58,7 @@ test.describe('uploading', () => {
     // Busy-state controls are asserted in "locks the controls…", which slows the
     // upload down enough to observe them; this small file can finish first.
     await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
-    await expect(ui.sha256).toHaveText(sha256OfFixture('small'));
+    await expect(ui.sha256).toHaveText(storedChecksumOf('small'));
     await expect(ui.progress).toHaveAttribute('value', '100');
     await expect(ui.pauseButton).toBeDisabled();
     await expect(ui.discardButton).toBeDisabled();
@@ -113,21 +113,26 @@ test.describe('uploading', () => {
 
     expect(sentAfterReload).toHaveLength(missingParts);
     expect(new Set(sentAfterReload).size).toBe(missingParts);
-    await expect(ui.sha256).toHaveText(sha256OfFixture('resumable'));
+    await expect(ui.sha256).toHaveText(storedChecksumOf('resumable'));
   });
 
   test('recovers from a 429 and a 503 mid-upload, throttling down, with identical bytes stored', async ({ page }) => {
     const ui = uploaderPage(page);
     const injected = new Set<string>();
     await page.route(PART_PUT, async (route) => {
-      const index = route.request().url().split('/').at(-1);
-      if (index === '2' && !injected.has('429')) {
+      const index = partIndexOf(route.request().url());
+      if (index === 2 && !injected.has('429')) {
         injected.add('429');
-        return route.fulfill({ status: 429, headers: { 'retry-after': '1' }, contentType: 'application/json', body: '{"error":{"code":"RATE_LIMITED","message":"Slow down"}}' });
+        return route.fulfill({
+          status: 429,
+          headers: { 'retry-after': '1', ...FAKE_RESPONSE_CORS },
+          contentType: 'application/json',
+          body: '{"error":{"code":"RATE_LIMITED","message":"Slow down"}}',
+        });
       }
-      if (index === '5' && !injected.has('503')) {
+      if (index === 5 && !injected.has('503')) {
         injected.add('503');
-        return route.fulfill({ status: 503, contentType: 'application/json', body: '{}' });
+        return route.fulfill({ status: 503, headers: FAKE_RESPONSE_CORS, contentType: 'application/json', body: '{}' });
       }
       return route.continue().catch(() => undefined);
     });
@@ -139,7 +144,7 @@ test.describe('uploading', () => {
     await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
 
     expect([...injected].sort()).toEqual(['429', '503']);
-    await expect(ui.sha256).toHaveText(sha256OfFixture('retried'));
+    await expect(ui.sha256).toHaveText(storedChecksumOf('retried'));
   });
 
   test('a failed finish is reported, keeps every part, and succeeds on retry', async ({ page }) => {
@@ -165,7 +170,7 @@ test.describe('uploading', () => {
     await ui.uploadButton.click();
     await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
     expect(partsSent).toBe(0);
-    await expect(ui.sha256).toHaveText(sha256OfFixture('small'));
+    await expect(ui.sha256).toHaveText(storedChecksumOf('small'));
   });
 });
 
@@ -237,7 +242,7 @@ test.describe('refusals', () => {
     await ui.uploadButton.click();
     await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
     await expect(ui.resumed).toHaveCount(0);
-    await expect(ui.sha256).toHaveText(sha256OfFixture('clashOther'));
+    await expect(ui.sha256).toHaveText(storedChecksumOf('clashOther'));
 
     // The first file is untouched: still 2 parts on the server, and it resumes
     // to its own exact bytes.
@@ -247,7 +252,7 @@ test.describe('refusals', () => {
     await ui.uploadButton.click();
     await expect(ui.resumed).toBeVisible();
     await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
-    await expect(ui.sha256).toHaveText(sha256OfFixture('clash'));
+    await expect(ui.sha256).toHaveText(storedChecksumOf('clash'));
   });
 
   test('refuses a file over MULTIPART_UPLOAD_MAX_FILE_BYTES without sending any part', async ({ page }) => {
@@ -300,7 +305,7 @@ test.describe('allowed file types', () => {
     await ui.uploadButton.click();
     await expect(ui.status).toContainText('Upload complete', { timeout: 60_000 });
     await expect(ui.contentType).toHaveText('image/png');
-    await expect(ui.sha256).toHaveText(sha256OfFixture('photo'));
+    await expect(ui.sha256).toHaveText(storedChecksumOf('photo'));
   });
 
   test('refuses an executable renamed to .png by its content, storing nothing', async ({ page }) => {
@@ -316,9 +321,12 @@ test.describe('allowed file types', () => {
     );
     await expect(ui.status).toContainText('Upload failed');
     await expect(ui.result).toHaveCount(0);
-    // Nothing stored; the parts are kept for the sweep, as documented.
+    // Nothing stored either way, as documented. Proxy transfer checks before the
+    // file exists and keeps the parts for the sweep; direct transfer can only
+    // check the committed file, so it deletes the file together with the session.
     const held = (await ui.uploadsOnServer()).find((u) => u.fileName === FIXTURES.disguisedExe.name);
-    expect(held?.receivedBytes).toBe(FIXTURES.disguisedExe.size);
+    if (E2E_TRANSFER === 'direct') expect(held).toBeUndefined();
+    else expect(held?.receivedBytes).toBe(FIXTURES.disguisedExe.size);
   });
 
   test('refuses a disallowed type before sending any part', async ({ page }) => {
