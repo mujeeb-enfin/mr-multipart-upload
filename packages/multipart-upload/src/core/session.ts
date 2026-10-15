@@ -47,6 +47,55 @@ export interface UploadManifest {
    * readers then derive it from the file name.
    */
   readonly contentType?: string;
+  /**
+   * Cloud backends only: the provider's multipart session. Written once at
+   * begin. For S3 / MinIO this holds S3's UploadId — the one value in the
+   * system that is not derived, so it is persisted where the derived upload id
+   * points. Azure needs none: block ids are derived from the part.
+   */
+  readonly cloud?: CloudSessionRef;
+  /**
+   * Cloud backends only: set once the provider has committed the file. A
+   * retried `complete` (after onComplete failed) then skips the commit — the
+   * provider's parts no longer exist to commit again.
+   */
+  readonly committed?: CommittedFileRef;
+  /**
+   * Cloud backends only: written just BEFORE the provider commit. If the server
+   * stops between that commit and recording `committed`, this marker is what
+   * shows the object at the final key came from this upload — and not from an
+   * earlier, completed upload of the same file, which shares the key.
+   */
+  readonly commitStartedAt?: string;
+}
+
+export interface CloudSessionRef {
+  readonly kind: 'aws_s3' | 'minio' | 'azure_blob';
+  /** Object key / blob name of the final file, fixed when the session begins. */
+  readonly key: string;
+  /** S3 / MinIO multipart UploadId. Absent for Azure. */
+  readonly uploadId?: string;
+}
+
+export interface FileChecksum {
+  /**
+   * `sha256`: SHA-256 of the stored bytes (local storage).
+   * `sha256-composite`: SHA-256 of the concatenated per-part SHA-256 digests —
+   * S3's composite checksum definition; also used for Azure. Not the plain
+   * SHA-256 of the file: S3 and Azure do not compute one for multipart uploads.
+   */
+  readonly type: 'sha256' | 'sha256-composite';
+  /** Lowercase hex. */
+  readonly value: string;
+  /** Composite only: the number of parts it covers. */
+  readonly parts?: number;
+}
+
+export interface CommittedFileRef {
+  readonly key: string;
+  readonly size: number;
+  readonly contentType: string;
+  readonly checksum: FileChecksum | null;
 }
 
 export interface UploadSession {

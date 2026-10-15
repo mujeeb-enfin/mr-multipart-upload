@@ -28,7 +28,7 @@ import { UploadError } from '../core/errors.js';
 import { FILES_DIR, PARTS_DIR, lockKey, parsePartFileName, partKey, sessionKey, stagingKey } from '../core/layout.js';
 import { expectedPartBytes } from '../core/arithmetic.js';
 import { SIGNATURE_BYTES } from '../core/file-signatures.js';
-import type { UploadMetadata } from '../core/session.js';
+import type { FileChecksum, UploadMetadata } from '../core/session.js';
 import { assertContentAllowed, declaredTypeFor } from './file-types.js';
 import { partTagFor } from './namespace.js';
 import { readManifest, readSession, type StoreContext } from './store.js';
@@ -43,8 +43,18 @@ export interface CompletedFile {
   /** Absolute path on disk, when the backend has one (the filesystem does). */
   readonly localPath: string | undefined;
   readonly size: number;
-  /** Lowercase hex SHA-256 of the stored bytes. */
+  /**
+   * Lowercase hex SHA-256 of the stored bytes — local storage. Empty for the
+   * cloud backends, which do not compute a plain SHA-256 of a multipart file;
+   * use `checksum` there.
+   */
   readonly sha256: string;
+  /**
+   * The stored file's checksum, for every backend: an exact `sha256` locally, a
+   * `sha256-composite` (SHA-256 of the part SHA-256s) in the cloud, or null when
+   * the provider holds no verified per-part hashes (Azure with direct transfer).
+   */
+  readonly checksum: FileChecksum | null;
   /** The file name the user picked. */
   readonly fileName: string;
   /**
@@ -71,6 +81,8 @@ export interface CompleteResult {
   readonly key: string;
   readonly size: number;
   readonly sha256: string;
+  /** Same as `CompletedFile.checksum`. */
+  readonly checksum: FileChecksum | null;
   /** Same as `CompletedFile.contentType`. */
   readonly contentType: string;
   readonly deduplicated: boolean;
@@ -229,11 +241,13 @@ export async function completeUpload(
     }
     stagingExists = false;
 
+    const checksum: FileChecksum = { type: 'sha256', value: assembly.sha256 };
     const file: CompletedFile = {
       key,
       localPath: store.storage.localPath?.(key),
       size: assembly.bytesWritten,
       sha256: assembly.sha256,
+      checksum,
       fileName: manifest.fileName,
       contentType,
       read: () => store.storage.openRead(key),
@@ -259,6 +273,7 @@ export async function completeUpload(
       key,
       size: assembly.bytesWritten,
       sha256: assembly.sha256,
+      checksum,
       contentType,
       deduplicated,
       result,

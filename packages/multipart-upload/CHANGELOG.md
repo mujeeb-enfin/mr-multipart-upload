@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.0
+
+### Added
+
+- **Cloud storage backends**, selected with `storage` (or `MULTIPART_UPLOAD_STORAGE`): `local` (default), `aws_s3`, `minio` and `azure_blob`. Each uses the provider's native multipart API (S3 `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`; Azure `Put Block` / `Put Block List`); resume, pause, discard, `allowedTypes`, per-user isolation and the sweep work on all four.
+  - `aws_s3`: an IAM user's keys, or no keys at all — the AWS SDK default chain (instance profile, ECS task role, EKS, Lambda, SSO, profiles). S3-compatible services through `endpoint`.
+  - `minio`: endpoint, bucket and the MinIO user's keys; path-style addressing.
+  - `azure_blob`: connection string, account key, SAS token, or Microsoft Entra ID (`DefaultAzureCredential`).
+- **Direct transfer** (`transfer: 'direct'`): the browser sends parts straight to S3 / MinIO / Azure with short-lived signed URLs from `POST /api/uploads/:id/parts/:n/url`. S3 URLs sign the part's SHA-256 and exact length; Azure SAS URLs are write-only for one blob, with an MD5 Azure verifies. The client follows the server's mode automatically and fetches a fresh URL per attempt.
+- `checksum` on the stored file and the client's result: the exact `sha256` (local), or `sha256-composite` — SHA-256 of every part's SHA-256, S3's definition — for cloud storage.
+- Every cloud setting is validated at startup and named in errors (part size ≥ 5 MiB for S3, the providers' part-count limits, direct transfer's preconditions); no secret appears in any message.
+- The cloud SDKs are optional peer dependencies; a missing one is reported with the package to install.
+- Crash safety for cloud commits: a `complete` that stops between the provider's commit and recording it is finished by the next `complete` (reported with `checksum: null`, since the composite cannot be recomputed), and discard or the sweep removes the file it left. A marker written before each commit tells such a file apart from an earlier, completed upload of the same file, which is never claimed or deleted.
+
+### Fixed
+
+- A pause that landed after a part was accepted but before its response body was read ended the upload with `NETWORK` instead of pausing it.
+
+### Security
+
+- With proxy transfer the content check runs before the file exists, on the first bytes of part 1 — kept bound to that part's SHA-256, so two concurrent sends of part 1 with different bytes cannot get one version approved and the other stored.
+
 ## 0.2.0
 
 ### Added

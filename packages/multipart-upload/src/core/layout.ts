@@ -55,6 +55,21 @@ export const STAGING_FILE = 'assembled.bin';
 export const LOCK_FILE = 'completing.lock';
 
 /**
+ * Cloud backends only: the file's first bytes, kept when part 1 arrives through
+ * the server. S3 and Azure cannot read parts before they are committed, so this
+ * is what lets the content check run BEFORE the file exists.
+ */
+export const HEAD_FILE = 'head.bin';
+
+/**
+ * Cloud backends only: rewritten on every part. Parts live inside the
+ * provider's multipart session, not as files here, and Azure's Put Block does
+ * not even update the blob's last-modified time — so this is what the sweep
+ * measures an upload's age by.
+ */
+export const ACTIVITY_FILE = 'activity';
+
+/**
  * Digits in a part filename.
  *
  * Six, so names sort lexically in the same order as numerically — the property a
@@ -92,6 +107,14 @@ export function stagingKey(namespaceKey: string, uploadId: string): string {
 
 export function lockKey(namespaceKey: string, uploadId: string): string {
   return `${sessionKey(namespaceKey, uploadId)}/${LOCK_FILE}`;
+}
+
+export function headKey(namespaceKey: string, uploadId: string): string {
+  return `${sessionKey(namespaceKey, uploadId)}/${HEAD_FILE}`;
+}
+
+export function activityKey(namespaceKey: string, uploadId: string): string {
+  return `${sessionKey(namespaceKey, uploadId)}/${ACTIVITY_FILE}`;
 }
 
 /**

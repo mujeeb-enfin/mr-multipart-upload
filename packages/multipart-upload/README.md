@@ -4,7 +4,9 @@ Resumable multipart file uploads for **Next.js** — App Router route handlers, 
 
 Large files are sent in parts. If the connection drops, the tab closes or the server restarts, picking the same file again sends **only the parts the server does not already have**.
 
-- **Configured in code**, with `.env` as the fallback: maximum file size, part size, allowed file types, storage folder.
+- **Four storage backends**: the local filesystem (default), **Amazon S3**, **MinIO** and **Azure Blob Storage** — each using the provider's native multipart API.
+- **Two transfer modes**: through your server (`proxy`, default), or straight from the browser to S3 / MinIO / Azure with short-lived signed URLs (`direct`).
+- **Configured in code**, with `.env` as the fallback: maximum file size, part size, allowed file types, storage.
 - **File types verified by content.** `allowedTypes: ['image/*', 'application/pdf']` refuses a renamed executable, not just a wrong extension.
 - **SHA-256 throughout.** Each upload's folder is the SHA-256 of its name, size, MIME type and content fingerprint; every part is checksummed in transit; the stored file is hashed as it is written.
 - **No database.** The filesystem is the state; the server works out what it has by listing a directory.
@@ -22,6 +24,7 @@ Requires Node.js 20.9 or later and the Next.js App Router. The package is ESM-on
 - [Quick start](#quick-start)
 - [A complete example](#a-complete-example)
 - [Configuration](#configuration)
+- [Storage backends: local, S3, MinIO, Azure](#storage-backends-local-s3-minio-azure)
 - [Restricting file types](#restricting-file-types)
 - [What users see](#what-users-see)
 - [Server API](#server-api--mr_innovationsmultipart-uploadserver)
@@ -168,6 +171,10 @@ Pass settings as parameters to `createUploadRoutes()`. Every one is optional, an
 | `dir` | `MULTIPART_UPLOAD_DIR` | `./uploads` | Where parts and finished files are stored. |
 | `partTtlMs` | `MULTIPART_UPLOAD_PART_TTL_HOURS` (in **hours**) | 48 hours | Unfinished uploads untouched this long are removed. |
 | `instanceId` | `MULTIPART_UPLOAD_INSTANCE_ID` | `single` | A distinct value per server, if you run more than one. |
+| `storage` | `MULTIPART_UPLOAD_STORAGE` | `local` | `local`, `aws_s3`, `minio` or `azure_blob` — see [Storage backends](#storage-backends-local-s3-minio-azure). |
+| `transfer` | `MULTIPART_UPLOAD_TRANSFER` | `proxy` | `proxy` (through your server) or `direct` (browser → cloud storage). |
+| `directUrlTtlSeconds` | `MULTIPART_UPLOAD_DIRECT_URL_TTL_SECONDS` | `900` | Lifetime of a direct-transfer URL. |
+| `s3`, `minio`, `azure` | `MULTIPART_UPLOAD_S3_*`, `_MINIO_*`, `_AZURE_*` | — | The chosen backend's settings. |
 
 ```ts
 createUploadRoutes({
@@ -201,6 +208,166 @@ Remember to add `uploads/` (or your `dir`) to `.gitignore`.
 - The browser learns the size limit from the server, so it is configured in one place only. An oversized file is refused before any of it is sent.
 
 **Reverse proxies:** each part is one request body. Allow at least the part size plus some headroom — with nginx, `client_max_body_size 10m;` covers the 8 MiB maximum.
+
+---
+
+## Storage backends: local, S3, MinIO, Azure
+
+| `storage` | Where files go | Install |
+|---|---|---|
+| `local` (default) | The server's filesystem (`dir`) | nothing |
+| `aws_s3` | Amazon S3, or an S3-compatible service (Cloudflare R2, Wasabi, …) | `npm install @aws-sdk/client-s3` (+ `@aws-sdk/s3-request-presigner` for direct transfer) |
+| `minio` | A MinIO server | the same two packages as `aws_s3` |
+| `azure_blob` | Azure Blob Storage (block blobs) | `npm install @azure/storage-blob` (+ `@azure/identity` for Microsoft Entra ID) |
+
+The SDKs are **optional peer dependencies**: an app on local storage installs none of them. Selecting a backend whose SDK is missing fails with a message naming the package to install.
+
+Every backend uses the provider's **native multipart upload** — S3 `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`, Azure `Put Block` / `Put Block List`. Parts are assembled by the provider; nothing is downloaded and re-uploaded. Resume, pause, discard, `allowedTypes`, per-user isolation and the client API work the same on all four.
+
+```ts
+createUploadRoutes({
+  authorize,
+  storage: 'aws_s3',                   // or MULTIPART_UPLOAD_STORAGE
+  transfer: 'proxy',                   // or 'direct' — MULTIPART_UPLOAD_TRANSFER
+  partBytes: 5 * 1024 * 1024,          // S3 and MinIO require at least 5 MiB
+  s3: { bucket: 'my-uploads', region: 'eu-west-1' },
+});
+```
+
+### Proxy or direct transfer
+
+| | `proxy` (default) | `direct` |
+|---|---|---|
+| Path of each part | browser → your server → storage | browser → storage, with a short-lived signed URL from your server |
+| Your server's bandwidth | carries every byte | carries none of the file |
+| Serverless hosts (Vercel, 4.5 MB body limit) | `local` no; cloud only if parts fit the platform's body limit — S3's 5 MiB minimum does not | **yes** |
+| Per-part integrity | the server verifies SHA-256; S3 verifies it again | S3: SHA-256 and exact length are **signed into the URL**, S3 enforces them · Azure: MD5 per block, enforced by Azure |
+| `allowedTypes` content check | **before** the file exists — a refused file is never stored | **after** commit, on the stored bytes — a refused file is deleted at once |
+| Storage configuration needed | none | a **CORS rule** on the bucket / container (below) |
+| `local` storage | yes | no |
+
+`direct` is refused at startup for `local` storage. URLs live for `directUrlTtlSeconds` (default 900; `MULTIPART_UPLOAD_DIRECT_URL_TTL_SECONDS`), are scoped to one part of one upload, and are issued only to the authorised owner of the upload. The client fetches a fresh URL for every attempt, so an expired one never strands a retry.
+
+### aws_s3
+
+| Parameter | `.env` fallback | Default |
+|---|---|---|
+| `s3.bucket` | `MULTIPART_UPLOAD_S3_BUCKET` | required |
+| `s3.region` | `MULTIPART_UPLOAD_S3_REGION`, then `AWS_REGION` / `AWS_DEFAULT_REGION` | required |
+| `s3.prefix` | `MULTIPART_UPLOAD_S3_PREFIX` | none — e.g. `uploads/` |
+| `s3.endpoint` | `MULTIPART_UPLOAD_S3_ENDPOINT` | AWS. Set it for R2, Wasabi and other S3-compatible services |
+| `s3.forcePathStyle` | `MULTIPART_UPLOAD_S3_FORCE_PATH_STYLE` | `false` |
+| `s3.credentials` | — | omitted: the AWS SDK default chain |
+
+**Credentials — two ways.**
+
+1. **An IAM user's access keys.** Pass them, or set the standard variables the AWS SDK reads itself:
+
+   ```ts
+   s3: { bucket, region, credentials: { accessKeyId: process.env.S3_KEY!, secretAccessKey: process.env.S3_SECRET! } }
+   ```
+   ```bash
+   AWS_ACCESS_KEY_ID=AKIA…
+   AWS_SECRET_ACCESS_KEY=…
+   ```
+
+2. **An IAM role — no keys at all.** Leave `credentials` out. The AWS SDK's default chain finds the role: the EC2 instance profile, the ECS task role, EKS IAM Roles for Service Accounts / Pod Identity, Lambda's execution role, AWS SSO, or a named profile. This is the recommended setup on AWS.
+
+**Minimum IAM policy** for the bucket (replace `my-uploads`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+      "Resource": "arn:aws:s3:::my-uploads/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Resource": "arn:aws:s3:::my-uploads"
+    }
+  ]
+}
+```
+
+**Lifecycle rule — strongly recommended.** S3 bills the parts of an unfinished multipart upload until it is aborted. The library's sweep aborts the ones it tracks; this rule also catches any left by a crash:
+
+```json
+{ "Rules": [{ "ID": "abort-incomplete-uploads", "Status": "Enabled", "Filter": {}, "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 3 } }] }
+```
+
+### minio
+
+| Parameter | `.env` fallback | Default |
+|---|---|---|
+| `minio.endpoint` | `MULTIPART_UPLOAD_MINIO_ENDPOINT` | required — e.g. `https://minio.example.com:9000` |
+| `minio.bucket` | `MULTIPART_UPLOAD_MINIO_BUCKET` | required |
+| `minio.accessKey` | `MULTIPART_UPLOAD_MINIO_ACCESS_KEY` | required |
+| `minio.secretKey` | `MULTIPART_UPLOAD_MINIO_SECRET_KEY` | required |
+| `minio.region` | `MULTIPART_UPLOAD_MINIO_REGION` | `us-east-1` |
+| `minio.prefix` | `MULTIPART_UPLOAD_MINIO_PREFIX` | none |
+
+MinIO has its own users and keys, not AWS IAM, so the keys are required. Path-style addressing is always used. Give the key's MinIO policy the same actions as the IAM policy above.
+
+### azure_blob
+
+| Parameter | `.env` fallback | Default |
+|---|---|---|
+| `azure.container` | `MULTIPART_UPLOAD_AZURE_CONTAINER` | required |
+| `azure.prefix` | `MULTIPART_UPLOAD_AZURE_PREFIX` | none |
+| `azure.connectionString` | `MULTIPART_UPLOAD_AZURE_CONNECTION_STRING`, then `AZURE_STORAGE_CONNECTION_STRING` | — |
+| `azure.accountUrl` | `MULTIPART_UPLOAD_AZURE_ACCOUNT_URL` | — `https://<account>.blob.core.windows.net` |
+| `azure.accountKey` | `MULTIPART_UPLOAD_AZURE_ACCOUNT_KEY` | — |
+| `azure.sasToken` | `MULTIPART_UPLOAD_AZURE_SAS_TOKEN` | — |
+| `azure.accountName` | `MULTIPART_UPLOAD_AZURE_ACCOUNT_NAME` | read from the URL |
+
+**Credentials — first match wins:**
+
+| You set | Used for | Direct transfer |
+|---|---|---|
+| a connection string | the account key in it | yes (service SAS) |
+| account URL + account key | shared key | yes (service SAS) |
+| account URL + SAS token | the SAS token | **no** — a SAS cannot sign new ones |
+| account URL only | **Microsoft Entra ID** via `DefaultAzureCredential`: managed identity, workload identity, a service principal (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`), or a developer login | yes (user delegation SAS) |
+
+With Entra ID, assign the identity **Storage Blob Data Contributor** on the container; direct transfer also needs **Storage Blob Delegator** (to request user delegation keys). Microsoft recommends Entra ID over account keys.
+
+### CORS for direct transfer
+
+The browser sends parts from your app's origin straight to the storage, so the storage must allow it.
+
+**S3 / MinIO** — bucket CORS configuration:
+
+```json
+[{ "AllowedOrigins": ["https://app.example.com"], "AllowedMethods": ["PUT"], "AllowedHeaders": ["*"], "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 3600 }]
+```
+
+**Azure** — Storage account → Resource sharing (CORS) → Blob service: allowed origin `https://app.example.com`, method `PUT`, allowed headers `*`, exposed headers `*`.
+
+### What differs by backend
+
+| | local | aws_s3 / minio | azure_blob |
+|---|---|---|---|
+| Part size | 1–8 MiB | **5–8 MiB** (S3's minimum is 5 MiB) | 1–8 MiB |
+| Most parts per file | 999,999 | 10,000 — 78 GiB at 8 MiB parts | 50,000 |
+| `checksum` of the stored file | `sha256`: the exact SHA-256 | `sha256-composite`: SHA-256 of every part's SHA-256 (S3's own definition) | `sha256-composite` with proxy transfer; **null** with direct transfer, where Azure verifies only MD5 |
+| `sha256` field | the exact SHA-256 | empty — S3 does not compute a plain SHA-256 of a multipart object | empty |
+| Deduplication | yes | no — the object key is fixed before any byte exists | no |
+| Default stored key | `files/<user hash>/<sha256>.<ext>` | `<prefix>files/<user hash>/<upload id>.<ext>` | the same |
+| `onComplete` fails | the file is removed, the parts are kept for a retry | the committed object is kept; a retried `complete` re-runs only `onComplete` | the same |
+| Server stops mid-`complete` | parts are kept; the retry assembles again | the retry finishes the committed file (`checksum: null`); discard or the sweep deletes it | the same |
+| Unfinished uploads | the sweep | the sweep aborts the S3 session; add the lifecycle rule above | the sweep deletes a blob holding only uncommitted blocks — never a stored file at the same key; Azure also discards uncommitted blocks after about 7 days |
+
+Configuration problems are refused at startup, with the setting named: a part size under 5 MiB for S3, a maximum size needing more parts than the provider allows, `direct` with local storage or with an Azure SAS token. No error ever contains a secret.
+
+**Limitations to know.**
+
+- With `direct` transfer to **Azure**, a SAS cannot restrict the size of a block. A wrong-sized block is never committed — the server checks every part's size — but Azure stores it until its uncommitted-block cleanup (about 7 days). S3 has no such gap: the length is signed into the URL.
+- The composite checksum is not the SHA-256 of the file and cannot be compared with one. It is reproducible from the file and the part size: SHA-256 over the concatenated SHA-256 of each part.
+- The cloud backends were tested against S3- and Azure-compatible emulators (VersityGW, which enforces SigV4 signatures and checksums, and Azurite) — not yet against AWS, a MinIO server or Azure themselves. IAM-role, Entra ID and user-delegation paths use the official SDKs' own credential handling and have not been exercised in this project's tests.
 
 ---
 
@@ -332,11 +499,11 @@ Returns `{ GET, POST, PUT, DELETE, uploader }`. Export the four handlers from yo
 | `basePath` | URL the route is mounted at. Default `/api/uploads`. |
 | `maxMetadataBytes` | Largest metadata object accepted. Default 16 KB. |
 | `headBytes` | Bytes passed to `validateHead`. Default 64 KB. |
-| `sweepOnBegin` | Remove expired unfinished uploads when a new one begins. Default `true`. |
+| `sweepOnBegin` | Remove expired unfinished uploads when a new one begins. Default `true` for local storage, `false` for cloud storage — there it would cost a request per stored object on every upload start; sweep on a schedule instead. |
 | `lockStaleMs` | A finishing lock older than this is treated as abandoned. Default 15 minutes. |
 | `onError(error, request)` | Called for unexpected (500) errors. Default: `console.error`. |
 | `storage` | A custom storage backend (see [Requirements and limitations](#requirements-and-limitations)). |
-| `maxFileBytes`, `partBytes`, `allowedTypes`, `dir`, `partTtlMs`, `instanceId` | The settings — see [Configuration](#configuration). Each falls back to its `.env` variable, then the default. |
+| `maxFileBytes`, `partBytes`, `allowedTypes`, `dir`, `partTtlMs`, `instanceId`, `storage`, `transfer`, `directUrlTtlSeconds`, `s3`, `minio`, `azure` | The settings — see [Configuration](#configuration). Each falls back to its `.env` variable, then the default. |
 
 The `file` passed to `onComplete`:
 
@@ -345,7 +512,8 @@ The `file` passed to `onComplete`:
   key: string;                   // storage key, relative to the storage folder (`dir`)
   localPath: string | undefined; // absolute path on disk (always set with the built-in filesystem storage)
   size: number;
-  sha256: string;                // lowercase hex, of the stored bytes
+  sha256: string;                // lowercase hex, of the stored bytes — local storage; '' for cloud storage
+  checksum: { type: 'sha256' | 'sha256-composite'; value: string; parts?: number } | null;
   fileName: string;              // the name the user picked
   contentType: string;           // verified from the content where the format has a signature
   read(): ReadableStream<Uint8Array>;
@@ -367,7 +535,7 @@ The same functionality without HTTP — `begin`, `putPart`, `status`, `list`, `c
 
 ### Cleaning up abandoned uploads
 
-There are no background timers. Expired uploads are removed when a new upload begins (`sweepOnBegin`). To clean up on a schedule as well, create the routes in a shared module so a cron route can reach the same uploader:
+There are no background timers. With local storage, expired uploads are removed when a new upload begins (`sweepOnBegin`). With cloud storage that is off by default, so **schedule the sweep** — and on S3 / MinIO add the lifecycle rule from [Storage backends](#aws_s3). To run it on a schedule, create the routes in a shared module so a cron route can reach the same uploader:
 
 ```ts
 // lib/uploads.ts
@@ -407,8 +575,8 @@ export async function POST() {
 | `reset()` | Return to idle without touching the server. |
 | `status` | `'idle' \| 'uploading' \| 'assembling' \| 'paused' \| 'done' \| 'error'` |
 | `progress` | `{ percent, sentBytes, totalBytes, partsDone, partsTotal, phase }` |
-| `startInfo` | `{ uploadId, resumed, receivedBytes, maxFileBytes, … }` once the server has answered. |
-| `result` | The completed upload: `{ uploadId, fileName, key, size, sha256, contentType, deduplicated, result }`, where `result` is whatever `onComplete` returned. |
+| `startInfo` | `{ uploadId, resumed, receivedBytes, maxFileBytes, transfer, … }` once the server has answered. |
+| `result` | The completed upload: `{ uploadId, fileName, key, size, sha256, checksum, contentType, deduplicated, result }`, where `result` is whatever `onComplete` returned. |
 | `error` | An `UploadClientError` with `message`, `status`, `code` and `details`. |
 
 Unmounting the component pauses the upload; it never discards it.
@@ -474,18 +642,28 @@ Each part's name also carries a **tag derived from the fingerprint**, and a part
 - **Size limits are enforced in the route.** A part is refused by its `Content-Length` before it is read, and reading stops at the limit if that header is wrong or missing.
 - **Paths are contained.** Upload ids are SHA-256 hashes — 64 lowercase hex characters — so no file name ever becomes part of a path, and every storage key passes a containment check against the storage directory.
 - **Deduplication is per user.** Identical files from the same user are stored once. It is deliberately not shared across users: a shared store would tell one user, through `deduplicated: true`, that someone else had uploaded the same file. A custom `destination` can change this — knowingly.
+- **Direct-transfer URLs are narrow.** Each is issued only to the authorised owner of the upload, for one part, for minutes. On S3 it is a presigned `UploadPart` with the part's SHA-256 and exact length signed in; on Azure a write-only SAS for one blob, with an MD5 Azure verifies. A server configured for `proxy` transfer never issues one.
+- **Secrets stay out of errors and logs.** Keys, secrets, SAS tokens and connection strings are never put in an error message; configuration errors name the setting only.
 - **The fingerprint is not a secret.** It only tells "the same file again" apart from "a different file". Access control is `authorize`'s job.
 
 ---
 
 ## Requirements and limitations
 
-- **A persistent, writable filesystem.** Self-hosted `next start`, Docker or a VPS. Serverless platforms with an ephemeral filesystem, such as Vercel functions, cannot keep parts between requests, so the built-in storage does not work there.
-- **One storage location per deployment.** With several servers, all must share the storage folder, or requests for one upload must reach the same server. Setting `instanceId` per server turns a cross-server resume into a clear `409 WRONG_INSTANCE` instead of a corrupted file.
+- **Local storage needs a persistent, writable filesystem.** Self-hosted `next start`, Docker or a VPS. Serverless platforms with an ephemeral filesystem, such as Vercel functions, cannot keep parts between requests — use `aws_s3`, `minio` or `azure_blob` with `transfer: 'direct'` there.
+- **One storage location per deployment.** With local storage on several servers, all must share the storage folder, or requests for one upload must reach the same server. Setting `instanceId` per server turns a cross-server resume into a clear `409 WRONG_INSTANCE` instead of a corrupted file. Cloud storage is shared by nature.
 - **ESM only.** Next.js handles this natively.
-- **Custom storage backends** implement the `StorageAdapter` interface. It is marked experimental until a second backend exists and may change before 1.0.
+- **Custom storage backends** implement the `StorageAdapter` interface. It may change before 1.0.
 
 ---
+
+## Upgrading from 0.2.x
+
+Nothing changes unless you opt in: `local` storage and `proxy` transfer stay the defaults, with the same behaviour.
+
+- **New:** `storage` (`aws_s3`, `minio`, `azure_blob`), `transfer: 'direct'`, the `checksum` field on the stored file and the client's result, and `transfer` in the client's `onStart` info.
+- **`storage` also accepts a string.** A custom `StorageAdapter` object still works as before.
+- **A pause that lands just after a part was accepted** now ends as `PAUSED`, as it should; it could previously end the upload with a `NETWORK` error.
 
 ## Upgrading from 0.1.x
 

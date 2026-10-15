@@ -32,6 +32,7 @@
 
 import { UploadClientError, isRetryable } from './errors.js';
 import { fingerprintFor } from './fingerprint.js';
+import { md5Base64 } from './md5.js';
 import { type PartSender, xhrPartSender } from './transport.js';
 
 export const FINGERPRINT_HEADER = 'x-upload-fingerprint';
@@ -79,6 +80,15 @@ export interface UploadStartInfo {
   readonly receivedBytes: number;
   readonly resumed: boolean;
   readonly maxFileBytes: number;
+  /** 'proxy': parts go through the server. 'direct': straight to the storage. */
+  readonly transfer: 'proxy' | 'direct';
+}
+
+/** The stored file's checksum, as the server reports it. */
+export interface UploadChecksum {
+  readonly type: 'sha256' | 'sha256-composite';
+  readonly value: string;
+  readonly parts?: number;
 }
 
 /** The server's response to `complete`. */
@@ -87,7 +97,10 @@ export interface UploadResult {
   readonly fileName: string;
   readonly key: string;
   readonly size: number;
+  /** Exact SHA-256 of the stored file — local storage. Empty for cloud storage; see `checksum`. */
   readonly sha256: string;
+  /** `sha256` (local) or `sha256-composite` (cloud), or null when none was verified. */
+  readonly checksum: UploadChecksum | null;
   /** The stored file's type — detected from its content where the format allows. */
   readonly contentType: string;
   readonly deduplicated: boolean;
@@ -166,6 +179,9 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
   let phase: UploadPhase = 'starting';
   let partBytes = 0;
   let partCount = 0;
+  // Set from the server's `begin` answer: how THIS server receives parts.
+  let transfer: 'proxy' | 'direct' = 'proxy';
+  let directChecksums: readonly string[] = [];
   const sentByPart = new Map<number, number>();
   const settled = new Set<number>();
 
@@ -233,27 +249,49 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
     // across retries. See transport.ts for why this is an ArrayBuffer.
     const body = await sliceFor(index).arrayBuffer();
     const checksum = await sha256Hex(body);
+    const direct = transfer === 'direct';
+    if (direct && !checksum) {
+      // The storage verifies each part against the SHA-256 signed into its URL;
+      // without one the part cannot be sent safely.
+      throw new UploadClientError('Direct uploads need a secure context (HTTPS or localhost) to compute part checksums.', 0, 'INSECURE_CONTEXT');
+    }
+    const md5 = direct && directChecksums.includes('md5') ? md5Base64(body) : undefined;
     const partHeaders: Record<string, string> = {
       'content-type': 'application/octet-stream',
       [FINGERPRINT_HEADER]: fingerprint,
       ...(checksum ? { [PART_CHECKSUM_HEADER]: checksum } : {}),
     };
+    const onPartProgress = (loaded: number) => {
+      if (settled.has(index)) return;
+      sentByPart.set(index, loaded);
+      report();
+    };
     for (;;) {
       const attempt = (attemptsByPart.get(index) ?? 0) + 1;
       attemptsByPart.set(index, attempt);
       if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
-      const response = await sendPart({
-        url: `${endpoint}/${encodeURIComponent(uploadId as string)}/parts/${index}`,
-        body,
-        credentials,
-        signal: controller.signal,
-        headers: await headers(partHeaders),
-        onProgress: (loaded) => {
-          if (settled.has(index)) return;
-          sentByPart.set(index, loaded);
-          report();
-        },
-      }).catch((err: unknown) => {
+      const response = await (async () => {
+        if (!direct) {
+          return sendPart({
+            url: `${endpoint}/${encodeURIComponent(uploadId as string)}/parts/${index}`,
+            body,
+            credentials,
+            signal: controller.signal,
+            headers: await headers(partHeaders),
+            onProgress: onPartProgress,
+          });
+        }
+        // A fresh signed request per attempt, so a retry never carries a URL
+        // that expired during the backoff. Sent straight to the storage, with
+        // only the signed headers and no cookies.
+        const signed = await control<{ url: string; headers: Record<string, string> }>(
+          'POST',
+          `/${encodeURIComponent(uploadId as string)}/parts/${index}/url`,
+          { fingerprint, sha256: checksum, ...(md5 ? { md5 } : {}) },
+        );
+        if (!signed) throw new UploadClientError('The server did not sign the part.', 0);
+        return sendPart({ url: signed.url, body, credentials: 'omit', signal: controller.signal, headers: signed.headers, onProgress: onPartProgress });
+      })().catch((err: unknown) => {
         if (err instanceof UploadClientError) return err;
         return new UploadClientError(String(err), 0, 'NETWORK');
       });
@@ -276,8 +314,15 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
       // Credit nothing for a failed attempt, so the bar does not sit at a number
       // this part never reached.
       sentByPart.delete(index);
-      if (failure.code === 'PAUSED' || controller.signal.aborted) throw failure;
-      if (!isRetryable(failure.status, failure.code) || attempt === maxAttempts) throw failure;
+      // Once paused, any failure is the pause: a part cut off by it must not end
+      // the upload as an error the user did not cause.
+      if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
+      if (failure.code === 'PAUSED') throw failure;
+      // Direct transfer: the storage answers 403 for an expired or skewed
+      // signature and 400 for bytes that failed its checksum — both cured by a
+      // fresh URL and a resend, within the attempt limit.
+      const retryableDirect = direct && !failure.code && (failure.status === 400 || failure.status === 403);
+      if ((!retryableDirect && !isRetryable(failure.status, failure.code)) || attempt === maxAttempts) throw failure;
 
       if (failure.status === 429) {
         // Self-limit for the rest of the run rather than oscillate: an upload that
@@ -306,7 +351,7 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
     // From here to `beginSettled` below is synchronous, so a discard either
     // happened before this check (begin is not sent) or after (it waits for it).
     if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
-    const beginRequest = control<UploadStartInfo & { missingParts: number[] }>(
+    const beginRequest = control<UploadStartInfo & { missingParts: number[]; directChecksums?: string[] }>(
       'POST',
       '',
       // contentType lets the server refuse a disallowed type before any part is
@@ -323,6 +368,8 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
     if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
     partBytes = begun.partBytes;
     partCount = begun.partCount;
+    transfer = begun.transfer === 'direct' ? 'direct' : 'proxy';
+    directChecksums = begun.directChecksums ?? [];
     options.onStart?.({
       uploadId: begun.uploadId,
       partCount,
@@ -330,6 +377,7 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
       receivedBytes: begun.receivedBytes,
       resumed: begun.receivedBytes > 0,
       maxFileBytes: begun.maxFileBytes,
+      transfer,
     });
 
     // Pre-credit what the server already holds, so a resume starts at its real

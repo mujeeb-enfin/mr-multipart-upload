@@ -47,7 +47,16 @@ async function measure(storage: StorageAdapter, dirKey: string): Promise<{ bytes
   return { bytes, newest };
 }
 
-export async function sweepStaleUploads(storage: StorageAdapter, ttlMs: number): Promise<SweepResult> {
+/**
+ * `beforeRemove` lets a cloud backend release the provider's side of a stale
+ * session (abort the S3 multipart upload, delete the Azure blob) before its
+ * control files are removed.
+ */
+export async function sweepStaleUploads(
+  storage: StorageAdapter,
+  ttlMs: number,
+  beforeRemove?: (dirKey: string) => Promise<void>,
+): Promise<SweepResult> {
   const result: SweepResult = { scanned: 0, deleted: 0, errors: 0, freedBytes: 0 };
   const cutoff = Date.now() - ttlMs;
 
@@ -61,6 +70,7 @@ export async function sweepStaleUploads(storage: StorageAdapter, ttlMs: number):
         if (!info?.isDirectory) continue;
         const { bytes, newest } = await measure(storage, dirKey);
         if (newest >= cutoff) continue;
+        if (beforeRemove) await beforeRemove(dirKey);
         await storage.removeTree(dirKey);
         result.deleted += 1;
         result.freedBytes += bytes;

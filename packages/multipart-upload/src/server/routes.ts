@@ -210,10 +210,31 @@ export function createUploadRoutes(options: UploadRoutesOptions = {}): UploadRou
           metadata: body.metadata as never,
           ...(body.contentType !== undefined ? { contentType: body.contentType as string } : {}),
         });
-        return json(sessionView(session, uploader.config().maxFileBytes), created ? 201 : 200);
+        // The transfer mode travels with the session, so the browser sends parts
+        // the way THIS server is configured to receive them.
+        const transfer = await uploader.transferInfo();
+        return json(
+          { ...sessionView(session, uploader.config().maxFileBytes), transfer: transfer.transfer, directChecksums: transfer.directChecksums },
+          created ? 201 : 200,
+        );
       }
       if (segments.length === 2 && segments[1] === 'complete') {
         return json(await uploader.complete(ctx, segments[0] as string), 201);
+      }
+      // Direct transfer: POST /:id/parts/:n/url → a signed request for that part.
+      if (segments.length === 4 && segments[1] === 'parts' && segments[3] === 'url') {
+        const rawIndex = segments[2] as string;
+        if (!/^[0-9]{1,6}$/.test(rawIndex)) throw new UploadError('PART_OUT_OF_RANGE', `"${rawIndex}" is not a valid part number.`);
+        const body = await readJson(request, maxJsonBytes);
+        return json(
+          await uploader.presignPart(ctx, {
+            uploadId: segments[0] as string,
+            index: Number(rawIndex),
+            fingerprint: body.fingerprint as string,
+            sha256: body.sha256 as string,
+            ...(body.md5 !== undefined ? { md5: body.md5 as string } : {}),
+          }),
+        );
       }
       throw notFound('POST');
     }),

@@ -15,18 +15,26 @@ import { describeByteSize } from '../core/format.js';
 import { lockKey, manifestKey, namespaceDirKey, partKey, sessionKey } from '../core/layout.js';
 import { type UploadManifest, type UploadMetadata, type UploadSession, summariseSession } from '../core/session.js';
 import { assertSafeUploadId } from '../core/slug.js';
-import type { StorageAdapter } from '../storage/adapter.js';
 import { FsStorage } from '../storage/fs-storage.js';
+import type { DirectPartRequest } from '../storage/cloud/types.js';
+import { cloudBackendFor } from './cloud-backends.js';
+import {
+  cloudDestinationFor,
+  cloudSweepRelease,
+  completeCloudUpload,
+  discardCloudUpload,
+  presignCloudPart,
+  storeCloudPart,
+} from './cloud-flow.js';
 import { completeUpload, DEFAULT_LOCK_STALE_MS, type CompleteHookInput, type CompleteResult } from './complete.js';
 import { type ConfigOverrides, type ResolvedConfig, resolveConfig } from './config.js';
 import { assertDeclaredTypeAllowed, declaredTypeFor } from './file-types.js';
 import { namespaceKeyFor, partTagFor, uploadIdFor } from './namespace.js';
+import { type ResolvedStorage, type StorageOverrides, resolveStorage } from './storage-config.js';
 import { listVerifiedParts, readManifest, readSession, findSession, type StoreContext } from './store.js';
 import { sweepStaleUploads, type SweepResult } from './sweep.js';
 
-export interface UploaderOptions extends ConfigOverrides {
-  /** Storage backend. Defaults to the filesystem at MULTIPART_UPLOAD_DIR. */
-  storage?: StorageAdapter;
+export interface UploaderOptions extends ConfigOverrides, StorageOverrides {
   /** Largest JSON metadata object accepted at begin. Default 16 KB. */
   maxMetadataBytes?: number;
   /** Bytes of the file's start passed to `validateHead`. Default 64 KB. */
@@ -47,11 +55,17 @@ export interface UploaderOptions extends ConfigOverrides {
    */
   onComplete?: (input: CompleteHookInput) => unknown | Promise<unknown>;
   /**
-   * Storage key for a completed file. Default:
+   * Storage key for a completed file. Default (local):
    * `files/<namespace hash>/<sha256>.<ext>` — content-addressed and per-namespace.
+   * Cloud backends call it when the upload BEGINS, before any byte exists, so
+   * `sha256` is '' there and the default is `files/<namespace hash>/<uploadId>.<ext>`.
    */
-  destination?: (info: { sha256: string; extension: string; namespaceKey: string; fileName: string }) => string;
-  /** Remove expired unfinished uploads when a new one begins. Default true. */
+  destination?: (info: { sha256: string; extension: string; namespaceKey: string; fileName: string; uploadId?: string }) => string;
+  /**
+   * Remove expired unfinished uploads when a new one begins. Default: true for
+   * local storage, false for cloud storage (where it would cost a request per
+   * stored object on every upload start — sweep on a schedule instead).
+   */
   sweepOnBegin?: boolean;
   /** A `complete` lock older than this is considered abandoned. Default 15 min. */
   lockStaleMs?: number;
@@ -94,8 +108,36 @@ export interface PutPartResult {
   readonly alreadyPresent: boolean;
 }
 
+/** Direct transfer: ask for a signed URL to send one part straight to the storage. */
+export interface PresignPartInput {
+  readonly uploadId: string;
+  readonly index: number;
+  readonly fingerprint: string;
+  /** Lowercase hex SHA-256 of the part. Signed into the request; the storage verifies it. */
+  readonly sha256: string;
+  /** Base64 MD5 of the part — required by azure_blob, which verifies MD5 per block. */
+  readonly md5?: string;
+}
+
+export interface PresignPartResult extends DirectPartRequest {
+  readonly index: number;
+  readonly length: number;
+}
+
+/** How the browser should send parts, for the `begin` response. */
+export interface TransferInfo {
+  readonly transfer: ResolvedStorage['transfer'];
+  readonly storage: ResolvedStorage['kind'];
+  /** Checksums the browser must compute per part for direct transfer. */
+  readonly directChecksums: readonly ('sha256' | 'md5')[];
+}
+
 export interface Uploader {
   config(): ResolvedConfig;
+  /** The storage kind and transfer mode in force, and what direct transfer needs. */
+  transferInfo(): Promise<TransferInfo>;
+  /** Direct transfer only: a short-lived signed request for one part. */
+  presignPart(ctx: UploadContext, input: PresignPartInput): Promise<PresignPartResult>;
   begin(ctx: UploadContext, input: BeginInput): Promise<{ session: UploadSession; created: boolean }>;
   status(ctx: UploadContext, uploadId: string): Promise<UploadSession>;
   list(ctx: UploadContext): Promise<UploadSession[]>;
@@ -124,14 +166,28 @@ function validateMetadata(metadata: unknown, limit: number): UploadMetadata {
 export function createUploader(options: UploaderOptions = {}): Uploader {
   const maxMetadataBytes = options.maxMetadataBytes ?? DEFAULT_MAX_METADATA_BYTES;
 
-  /** Configuration is resolved per call, so a changed .env value is honoured. */
-  function contextFor(ctx: UploadContext): StoreContext {
+  /**
+   * Configuration is resolved per call, so a changed .env value is honoured.
+   * Cloud clients are NOT recreated per call — see cloud-backends.ts.
+   */
+  async function storeFor(namespaceKey: string): Promise<StoreContext> {
     const config = resolveConfig(options);
-    return {
-      config,
-      storage: options.storage ?? new FsStorage(config.dir),
-      namespaceKey: namespaceKeyFor(ctx.namespace),
-    };
+    const storageConfig = resolveStorage(options, config);
+    if (storageConfig.backend) {
+      const backend = await cloudBackendFor(storageConfig.backend);
+      return { config, storageConfig, storage: backend.control, backend, namespaceKey };
+    }
+    const storage = typeof options.storage === 'object' ? options.storage : new FsStorage(config.dir);
+    return { config, storageConfig, storage, namespaceKey };
+  }
+
+  function contextFor(ctx: UploadContext): Promise<StoreContext> {
+    return storeFor(namespaceKeyFor(ctx.namespace));
+  }
+
+  /** Releases the provider's side of a stale cloud session before its files go. */
+  function sweepFor(store: StoreContext): Promise<SweepResult> {
+    return sweepStaleUploads(store.storage, store.config.partTtlMs, store.backend ? cloudSweepRelease(store.backend) : undefined);
   }
 
   function checkedId(uploadId: string): string {
@@ -140,7 +196,7 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
   }
 
   async function begin(ctx: UploadContext, input: BeginInput) {
-    const store = contextFor(ctx);
+    const store = await contextFor(ctx);
     const { config } = store;
 
     if (typeof input.fileName !== 'string' || input.fileName.length === 0 || input.fileName.length > 1024) {
@@ -183,10 +239,14 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     const uploadId = uploadIdFor(identity);
     const { partBytes } = config;
 
-    if (options.sweepOnBegin !== false) {
+    // Default: on for local storage, OFF for cloud storage. The sweep lists every
+    // session of every user; on a filesystem that is cheap, on S3 / Azure it is
+    // a request per object on every upload start. Cloud deployments sweep on a
+    // schedule (uploader.sweep()) and with the provider's lifecycle rules.
+    if (options.sweepOnBegin ?? !store.backend) {
       // Opportunistic and best-effort: a sweep problem must never block a new
       // upload. This is the caller that works with no operator action at all.
-      await sweepStaleUploads(store.storage, config.partTtlMs).catch(() => undefined);
+      await sweepFor(store).catch(() => undefined);
     }
 
     const resume = async (existing: UploadManifest) => {
@@ -222,6 +282,12 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     const existing = await readManifest(store, uploadId);
     if (existing) return resume(existing);
 
+    // Cloud: the provider's multipart session is opened first, because its id
+    // (S3's UploadId) must be in the manifest. Its final key is fixed now.
+    const cloud = store.backend
+      ? await store.backend.createSession(cloudDestinationFor(store, options, uploadId, input.fileName), contentType)
+      : undefined;
+
     const manifest: UploadManifest = {
       v: 1,
       uploadId,
@@ -235,6 +301,7 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       createdAt: new Date().toISOString(),
       metadata,
       contentType,
+      ...(cloud ? { cloud } : {}),
     };
 
     const outcome = await store.storage.createExclusive(
@@ -243,7 +310,9 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     );
     if (outcome === 'exists') {
       // Another request created it between the read and the write. Take the
-      // resume path rather than overwriting someone else's session.
+      // resume path rather than overwriting someone else's session — and drop
+      // the provider session this request opened, which nothing references.
+      if (cloud && store.backend) await store.backend.abortSession(cloud).catch(() => undefined);
       const raced = await readManifest(store, uploadId);
       if (raced) return resume(raced);
       throw new UploadError('NAME_IN_USE', 'Another request is starting this upload right now. Retry.', { uploadId });
@@ -252,24 +321,10 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
   }
 
   async function putPart(ctx: UploadContext, input: PutPartInput): Promise<PutPartResult> {
-    const store = contextFor(ctx);
+    const store = await contextFor(ctx);
     const uploadId = checkedId(input.uploadId);
     const { index, bytes } = input;
-
-    const manifest = await readManifest(store, uploadId);
-    if (!manifest) throw new UploadError('NO_SESSION', `No upload in progress for "${uploadId}"`);
-
-    // Checked on EVERY part, not only at begin: a client refused at begin still
-    // knows the upload id and could otherwise write into another file's session.
-    if (manifest.fingerprint !== input.fingerprint) {
-      throw new UploadError('FINGERPRINT_MISMATCH', 'This part belongs to a different file than the upload in progress.');
-    }
-    if (manifest.instanceId !== store.config.instanceId) {
-      throw new UploadError('WRONG_INSTANCE', `This upload's parts live on server instance "${manifest.instanceId}".`);
-    }
-    if (!Number.isInteger(index) || index < 1 || index > manifest.partCount) {
-      throw new UploadError('PART_OUT_OF_RANGE', `Part ${index} is outside 1..${manifest.partCount}`);
-    }
+    const manifest = await manifestForPart(store, uploadId, index, input.fingerprint);
     const expected = expectedPartBytes(index, manifest.partBytes, manifest.totalBytes);
     if (bytes.byteLength !== expected) {
       throw new UploadError('PART_LENGTH_MISMATCH', `Part ${index} must be ${expected} bytes, received ${bytes.byteLength}.`);
@@ -278,14 +333,20 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     // with the wrong content — which a WebKit build was found doing in testing:
     // every part carried part 1's bytes, every size check passed, and the upload
     // "succeeded". The client's checksum turns that into a loud, retryable error.
-    if (input.sha256 !== undefined) {
-      const actual = createHash('sha256').update(bytes).digest('hex');
-      if (actual !== input.sha256) {
-        throw new UploadError(
-          'PART_CHECKSUM_MISMATCH',
-          `Part ${index} arrived with different content from what was sent (checksum mismatch). Nothing was stored; send the part again.`,
-        );
-      }
+    const actual = createHash('sha256').update(bytes).digest('hex');
+    if (input.sha256 !== undefined && actual !== input.sha256) {
+      throw new UploadError(
+        'PART_CHECKSUM_MISMATCH',
+        `Part ${index} arrived with different content from what was sent (checksum mismatch). Nothing was stored; send the part again.`,
+      );
+    }
+
+    if (store.backend) {
+      // The provider holds the part; the server-verified SHA-256 goes with it
+      // (S3 checks it again; Azure gets it in the block id, plus an MD5 check).
+      await storeCloudPart(store, manifest, index, bytes, actual, options.headBytes);
+      const stored = summariseSession(manifest, await listVerifiedParts(store, manifest));
+      return { uploadId, index, receivedBytes: stored.receivedBytes, missingCount: stored.missingParts.length, alreadyPresent: false };
     }
 
     // Named with this upload's part tag, so a stray part file of anything else
@@ -324,8 +385,49 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     };
   }
 
+  /** The manifest a part belongs to, after every check that does not need the bytes. */
+  async function manifestForPart(store: StoreContext, uploadId: string, index: number, fingerprint: string): Promise<UploadManifest> {
+    const manifest = await readManifest(store, uploadId);
+    if (!manifest) throw new UploadError('NO_SESSION', `No upload in progress for "${uploadId}"`);
+    // Checked on EVERY part, not only at begin: a client refused at begin still
+    // knows the upload id and could otherwise write into another file's session.
+    if (manifest.fingerprint !== fingerprint) {
+      throw new UploadError('FINGERPRINT_MISMATCH', 'This part belongs to a different file than the upload in progress.');
+    }
+    if (manifest.instanceId !== store.config.instanceId) {
+      throw new UploadError('WRONG_INSTANCE', `This upload's parts live on server instance "${manifest.instanceId}".`);
+    }
+    if (!Number.isInteger(index) || index < 1 || index > manifest.partCount) {
+      throw new UploadError('PART_OUT_OF_RANGE', `Part ${index} is outside 1..${manifest.partCount}`);
+    }
+    if (manifest.committed) throw new UploadError('COMPLETE_IN_PROGRESS', 'This upload has already been committed.');
+    return manifest;
+  }
+
+  async function presignPart(ctx: UploadContext, input: PresignPartInput): Promise<PresignPartResult> {
+    const store = await contextFor(ctx);
+    // Refused unless the operator chose direct transfer: a server configured for
+    // proxy transfer must not hand out URLs that bypass it.
+    if (!store.backend || store.storageConfig.transfer !== 'direct') {
+      throw new UploadError('INVALID_REQUEST', 'Direct transfer is not enabled on this server; send parts through it.');
+    }
+    if (!store.backend.supportsDirect) {
+      throw new UploadError('CONFIG_INVALID', 'This storage configuration cannot sign direct-transfer URLs.');
+    }
+    if (typeof input.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(input.sha256)) {
+      throw new UploadError('INVALID_REQUEST', 'sha256 must be the part\'s lowercase hex SHA-256');
+    }
+    const needsMd5 = store.backend.directChecksums.includes('md5');
+    if (needsMd5 && (typeof input.md5 !== 'string' || !/^[A-Za-z0-9+/]{22}==$/.test(input.md5))) {
+      throw new UploadError('INVALID_REQUEST', 'md5 must be the part\'s base64 MD5 for this storage');
+    }
+    const uploadId = checkedId(input.uploadId);
+    const manifest = await manifestForPart(store, uploadId, input.index, input.fingerprint);
+    return presignCloudPart(store, manifest, input.index, input.sha256, needsMd5 ? input.md5 : undefined);
+  }
+
   async function list(ctx: UploadContext): Promise<UploadSession[]> {
-    const store = contextFor(ctx);
+    const store = await contextFor(ctx);
     const ids = await store.storage.list(namespaceDirKey(store.namespaceKey));
     const sessions: UploadSession[] = [];
     for (const id of ids) {
@@ -344,14 +446,30 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
 
   return {
     config: () => resolveConfig(options),
+    transferInfo: async () => {
+      const config = resolveConfig(options);
+      const storage = resolveStorage(options, config);
+      const backend = storage.backend ? await cloudBackendFor(storage.backend) : undefined;
+      return {
+        transfer: storage.transfer,
+        storage: storage.kind,
+        directChecksums: storage.transfer === 'direct' && backend ? backend.directChecksums : [],
+      };
+    },
+    presignPart,
     begin,
     putPart,
     list,
-    status: (ctx, uploadId) => readSession(contextFor(ctx), checkedId(uploadId)),
-    complete: (ctx, uploadId) =>
-      completeUpload(contextFor(ctx), checkedId(uploadId), ctx.namespace, options),
+    status: async (ctx, uploadId) => readSession(await contextFor(ctx), checkedId(uploadId)),
+    complete: async (ctx, uploadId) => {
+      const store = await contextFor(ctx);
+      const id = checkedId(uploadId);
+      return store.backend
+        ? completeCloudUpload(store, id, ctx.namespace, options)
+        : completeUpload(store, id, ctx.namespace, options);
+    },
     discard: async (ctx, uploadId) => {
-      const store = contextFor(ctx);
+      const store = await contextFor(ctx);
       const id = checkedId(uploadId);
       // Deleting the parts while `complete` is streaming them would turn a
       // successful finish into a half-assembled failure. A lock older than
@@ -360,11 +478,10 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       if (lock && Date.now() - lock.modifiedMs < (options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS)) {
         throw new UploadError('COMPLETE_IN_PROGRESS', 'This upload is being finalised and cannot be discarded now.');
       }
-      await store.storage.removeTree(sessionKey(store.namespaceKey, id));
+      if (store.backend) await discardCloudUpload(store, id);
+      else await store.storage.removeTree(sessionKey(store.namespaceKey, id));
     },
-    sweep: async () => {
-      const config = resolveConfig(options);
-      return sweepStaleUploads(options.storage ?? new FsStorage(config.dir), config.partTtlMs);
-    },
+    // The sweep spans every namespace; the namespace key here is unused.
+    sweep: async () => sweepFor(await storeFor('')),
   };
 }

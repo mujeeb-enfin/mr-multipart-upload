@@ -4,7 +4,30 @@ export { createUploadRoutes, FINGERPRINT_HEADER, PART_CHECKSUM_HEADER } from './
 export type { UploadRoutes, UploadRoutesOptions, RouteHandler } from './routes.js';
 
 export { createUploader } from './uploader.js';
-export type { Uploader, UploaderOptions, UploadContext, BeginInput, PutPartInput, PutPartResult } from './uploader.js';
+export type {
+  Uploader,
+  UploaderOptions,
+  UploadContext,
+  BeginInput,
+  PutPartInput,
+  PutPartResult,
+  PresignPartInput,
+  PresignPartResult,
+  TransferInfo,
+} from './uploader.js';
+
+// Storage: 'local' | 'aws_s3' | 'minio' | 'azure_blob', transfer 'proxy' | 'direct'.
+export { resolveStorage, STORAGE_KINDS, S3_MIN_PART_BYTES, S3_MAX_PARTS, AZURE_MAX_BLOCKS } from './storage-config.js';
+export type {
+  StorageKind,
+  TransferMode,
+  StorageOverrides,
+  S3StorageOptions,
+  MinioStorageOptions,
+  AzureStorageOptions,
+  ResolvedStorage,
+} from './storage-config.js';
+export type { CloudBackend, CloudPart, DirectPartRequest, CloudCommitResult } from '../storage/cloud/types.js';
 
 export type { CompleteHookInput, CompleteResult, CompletedFile } from './complete.js';
 export type { SweepResult } from './sweep.js';
@@ -18,7 +41,15 @@ export type { StorageAdapter, StoredObjectInfo, AssemblyResult } from '../storag
 
 export { UploadError, isUploadError } from '../core/errors.js';
 export type { UploadErrorCode } from '../core/errors.js';
-export type { UploadMetadata, JsonValue, UploadManifest, UploadSession } from '../core/session.js';
+export type {
+  UploadMetadata,
+  JsonValue,
+  UploadManifest,
+  UploadSession,
+  FileChecksum,
+  CloudSessionRef,
+  CommittedFileRef,
+} from '../core/session.js';
 export { slugifyFileName, uploadIdForFileName } from '../core/slug.js';
 
 // Ready-made allowedTypes lists: allowedTypes: [...FILE_TYPES.images, ...FILE_TYPES.pdf]

@@ -18,15 +18,30 @@ import { UploadError } from '../core/errors.js';
 import { manifestKey, partIndexFromFileName, partKey, sessionKey } from '../core/layout.js';
 import { type UploadManifest, type UploadSession, summariseSession } from '../core/session.js';
 import type { StorageAdapter } from '../storage/adapter.js';
+import type { CloudBackend, CloudPart } from '../storage/cloud/types.js';
 import type { ResolvedConfig } from './config.js';
 import { partTagFor } from './namespace.js';
+import type { ResolvedStorage } from './storage-config.js';
 
 /** Everything an operation needs once the caller has been authorised. */
 export interface StoreContext {
+  /** Control files: the local filesystem, or the cloud backend's objects. */
   readonly storage: StorageAdapter;
   readonly config: ResolvedConfig;
+  readonly storageConfig: ResolvedStorage;
+  /** Set for aws_s3 / minio / azure_blob: where the parts actually go. */
+  readonly backend?: CloudBackend;
   /** Hashed namespace directory of the authorised caller. */
   readonly namespaceKey: string;
+}
+
+/** The provider's parts that are exactly the size their index requires. */
+export async function listVerifiedCloudParts(ctx: StoreContext, manifest: UploadManifest): Promise<CloudPart[]> {
+  if (manifest.committed || !manifest.cloud || !ctx.backend) return [];
+  const parts = await ctx.backend.listParts(manifest.cloud);
+  return parts.filter(
+    (p) => p.index >= 1 && p.index <= manifest.partCount && p.size === expectedPartBytes(p.index, manifest.partBytes, manifest.totalBytes),
+  );
 }
 
 export async function readManifest(ctx: StoreContext, uploadId: string): Promise<UploadManifest | null> {
@@ -42,6 +57,7 @@ export async function readManifest(ctx: StoreContext, uploadId: string): Promise
  * write self-healing: a short file is not counted, so the part is re-sent.
  */
 export async function listVerifiedParts(ctx: StoreContext, manifest: UploadManifest): Promise<number[]> {
+  if (ctx.backend) return (await listVerifiedCloudParts(ctx, manifest)).map((p) => p.index);
   const entries = await ctx.storage.list(sessionKey(ctx.namespaceKey, manifest.uploadId));
   const tag = partTagFor(manifest.fingerprint);
   const verified: number[] = [];

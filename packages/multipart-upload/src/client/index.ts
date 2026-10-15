@@ -8,6 +8,7 @@ export type {
   UploadPhase,
   UploadResult,
   UploadStartInfo,
+  UploadChecksum,
   HeadersOption,
 } from './upload.js';
 export { UploadClientError, isRetryable } from './errors.js';

@@ -47,6 +47,12 @@ export interface StorageAdapter {
    */
   createExclusive(key: string, data: Uint8Array | string): Promise<'created' | 'exists'>;
 
+  /**
+   * Create or REPLACE `key`. Optional: used by the cloud backends for files that
+   * change during an upload (the activity marker, the manifest once committed).
+   */
+  write?(key: string, data: Uint8Array | string): Promise<void>;
+
   /** Delete one key. Absent is success. */
   remove(key: string): Promise<void>;
 

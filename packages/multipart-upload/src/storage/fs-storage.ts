@@ -100,6 +100,12 @@ export class FsStorage implements StorageAdapter {
     }
   }
 
+  async write(key: string, data: Uint8Array | string): Promise<void> {
+    const path = this.path(key);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, data);
+  }
+
   async remove(key: string): Promise<void> {
     try {
       await unlink(this.path(key));
