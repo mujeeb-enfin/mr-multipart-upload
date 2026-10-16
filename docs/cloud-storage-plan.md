@@ -57,7 +57,7 @@ Same precedence as every setting: **parameter → `.env` → default**. The exis
 | `azure.connectionString` / `accountKey` / `sasToken` | `AZURE_STORAGE_CONNECTION_STRING` / `MULTIPART_UPLOAD_AZURE_ACCOUNT_KEY` / `…_SAS_TOKEN` | **none → `DefaultAzureCredential`** |
 | `directUrlTtlSeconds` | `MULTIPART_UPLOAD_DIRECT_URL_TTL_SECONDS` | `900` |
 
-Secrets belong in `.env` only. Every value is validated at startup; errors name the setting. `aws_s3` requires `partBytes` 5–8 MiB.
+Secrets belong in `.env` only. Every value is validated before any byte is stored (on the first request that uses it); errors name the setting. `aws_s3` requires `partBytes` 5–8 MiB.
 
 ---
 

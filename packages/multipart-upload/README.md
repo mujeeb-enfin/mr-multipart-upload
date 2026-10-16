@@ -11,11 +11,24 @@ Large files are sent in parts. If the connection drops, the tab closes or the se
 - **SHA-256 throughout.** Each upload's folder is the SHA-256 of its name, size, MIME type and content fingerprint; every part is checksummed in transit; the stored file is hashed as it is written.
 - **No database.** The filesystem is the state; the server works out what it has by listing a directory.
 - **Isolated per user.** Two users uploading `photo.jpg` never share anything.
-- **Zero runtime dependencies.**
+- **Zero runtime dependencies.** Cloud storage SDKs are optional, installed only by apps that use them.
 
 ```bash
 npm install @mr_innovations/multipart-upload
 ```
+
+That is all local storage (the default) needs. For cloud storage, also install that provider's SDK — they are **not** installed with this package:
+
+```bash
+# aws_s3 or minio
+npm install @aws-sdk/client-s3 @aws-sdk/s3-request-presigner
+# azure_blob
+npm install @azure/storage-blob
+# azure_blob with Microsoft Entra ID (no connection string or account key)
+npm install @azure/storage-blob @azure/identity
+```
+
+See [Storage backends](#storage-backends-local-s3-minio-azure) for which package each feature needs.
 
 Requires Node.js 20.9 or later and the Next.js App Router. The package is ESM-only.
 
@@ -220,7 +233,20 @@ Remember to add `uploads/` (or your `dir`) to `.gitignore`.
 | `minio` | A MinIO server | the same two packages as `aws_s3` |
 | `azure_blob` | Azure Blob Storage (block blobs) | `npm install @azure/storage-blob` (+ `@azure/identity` for Microsoft Entra ID) |
 
-The SDKs are **optional peer dependencies**: an app on local storage installs none of them. Selecting a backend whose SDK is missing fails with a message naming the package to install.
+The SDKs are **optional peer dependencies**. npm, pnpm and Yarn do not install optional peers, so this package never brings them in: an app on local storage has none of them, and an app on cloud storage installs exactly the ones it uses — and an app that already uses the AWS or Azure SDK in a supported version keeps a single copy of it. Each is loaded only when first needed, so a package you do not use is never required.
+
+| Package | Supported versions | Needed for |
+|---|---|---|
+| `@aws-sdk/client-s3` | `^3.729.0` | `aws_s3`, `minio` |
+| `@aws-sdk/s3-request-presigner` | `^3.729.0` | `aws_s3`, `minio` with `transfer: 'direct'` |
+| `@azure/storage-blob` | `^12.20.0` | `azure_blob` |
+| `@azure/identity` | `^4.0.0` | `azure_blob` with Microsoft Entra ID |
+
+A missing SDK is reported when the backend is first used, as `CONFIG_INVALID` (500) with the command to run:
+
+```
+storage "aws_s3" needs the optional package @aws-sdk/client-s3. Install it: npm install @aws-sdk/client-s3
+```
 
 Every backend uses the provider's **native multipart upload** — S3 `CreateMultipartUpload` / `UploadPart` / `CompleteMultipartUpload`, Azure `Put Block` / `Put Block List`. Parts are assembled by the provider; nothing is downloaded and re-uploaded. Resume, pause, discard, `allowedTypes`, per-user isolation and the client API work the same on all four.
 
@@ -246,7 +272,7 @@ createUploadRoutes({
 | Storage configuration needed | none | a **CORS rule** on the bucket / container (below) |
 | `local` storage | yes | no |
 
-`direct` is refused at startup for `local` storage. URLs live for `directUrlTtlSeconds` (default 900; `MULTIPART_UPLOAD_DIRECT_URL_TTL_SECONDS`), are issued only to the authorised owner of the upload, and never name the stored file — see [How direct URLs are scoped](#cors-for-direct-transfer). The client fetches a fresh URL for every attempt, so an expired one never strands a retry.
+`direct` is refused for `local` storage, on the first request. URLs live for `directUrlTtlSeconds` (default 900; `MULTIPART_UPLOAD_DIRECT_URL_TTL_SECONDS`), are issued only to the authorised owner of the upload, and never name the stored file — see [How direct URLs are scoped](#cors-for-direct-transfer). The client fetches a fresh URL for every attempt, so an expired one never strands a retry.
 
 ### aws_s3
 
@@ -369,7 +395,7 @@ Add the rule alongside any you already have; it does not need to replace them.
 | Server stops mid-`complete` | parts are kept; the retry assembles again | the retry finishes the committed file (`checksum: null`) — after a reload too, which resumes with nothing left to send; discard or the sweep deletes it | the same |
 | Unfinished uploads | the sweep | the sweep aborts the S3 session; add the lifecycle rule above | proxy: the sweep deletes a blob holding only uncommitted blocks — never a stored file at the same key; direct: it deletes the session's staging blob, committed or not. Azure also discards uncommitted blocks after about 7 days |
 
-Configuration problems are refused at startup, with the setting named: a part size under 5 MiB for S3, a maximum size needing more parts than the provider allows, `direct` with local storage or with an Azure SAS token (alone or in a connection string). No error ever contains a secret.
+Configuration is read on every request (so a changed `.env` value takes effect without a restart), and a problem is refused on the first request that meets it — before any byte is stored — with the setting named: a part size under 5 MiB for S3, a maximum size needing more parts than the provider allows, `direct` with local storage or with an Azure SAS token (alone or in a connection string). No error ever contains a secret.
 
 **A custom `destination()` on cloud storage must return a different key for every upload** — use `sessionId`, which is new for each upload session and kept while it resumes. The key is chosen before any byte exists, so `sha256` is empty there; a 0.2.x-style `` `uploads/${sha256}.${extension}` `` would give every upload the same key. A commit onto an object the upload did not create is refused with `DESTINATION_EXISTS` rather than overwriting it. That check runs once, before the upload's first commit attempt; a retry of an attempt that failed part-way trusts the key, so a key shared between uploads is still a mistake, not a supported mode.
 
@@ -673,6 +699,7 @@ Each part's name also carries a **tag derived from the fingerprint**, and a part
 Nothing changes unless you opt in: `local` storage and `proxy` transfer stay the defaults, with the same behaviour.
 
 - **New:** `storage` (`aws_s3`, `minio`, `azure_blob`), `transfer: 'direct'`, the `checksum` field on the stored file and the client's result, and `transfer` in the client's `onStart` info.
+- **Cloud storage needs its SDK installed separately** — see [Storage backends](#storage-backends-local-s3-minio-azure). Apps staying on local storage install nothing new.
 - **`storage` also accepts a string.** A custom `StorageAdapter` object still works as before.
 - **A pause that lands just after a part was accepted** now ends as `PAUSED`, as it should; it could previously end the upload with a `NETWORK` error.
 
