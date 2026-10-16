@@ -183,7 +183,19 @@ function resolveS3(options: S3StorageOptions = {}): S3BackendConfig {
     prefix: normalisePrefix(pick(options.prefix, 'MULTIPART_UPLOAD_S3_PREFIX'), 's3.prefix (MULTIPART_UPLOAD_S3_PREFIX)'),
     ...(endpoint ? { endpoint: validUrl(endpoint, 's3.endpoint (MULTIPART_UPLOAD_S3_ENDPOINT)') } : {}),
     forcePathStyle,
-    ...(credentials ? { credentials } : {}),
+    // Copied field by field: the AWS SDK annotates the credentials object it is
+    // given (`$source`). Passing the caller's object through let that write
+    // change this configuration's cache key — a second client per config — and
+    // modify the application's own options.
+    ...(credentials
+      ? {
+          credentials: {
+            accessKeyId: credentials.accessKeyId,
+            secretAccessKey: credentials.secretAccessKey,
+            ...(credentials.sessionToken ? { sessionToken: credentials.sessionToken } : {}),
+          },
+        }
+      : {}),
   };
 }
 
@@ -236,7 +248,7 @@ function resolveAzure(options: AzureStorageOptions = {}): AzureBackendConfig {
 
 export function resolveStorage(options: StorageOverrides, config: ResolvedConfig): ResolvedStorage {
   let kind: StorageKind | 'custom';
-  if (options.storage !== undefined && typeof options.storage !== 'string') {
+  if (options.storage != null && typeof options.storage !== 'string') {
     kind = 'custom';
   } else {
     const raw = pick(options.storage, ENV.storage) ?? 'local';
@@ -279,7 +291,17 @@ export function resolveStorage(options: StorageOverrides, config: ResolvedConfig
   if (kind === 'azure_blob' && Math.ceil(config.maxFileBytes / config.partBytes) > AZURE_MAX_BLOCKS) {
     invalid('maxFileBytes (MULTIPART_UPLOAD_MAX_FILE_BYTES)', `needs more than ${AZURE_MAX_BLOCKS} parts at this part size; Azure allows ${AZURE_MAX_BLOCKS} blocks. Raise partBytes or lower the limit`);
   }
-  if (transfer === 'direct' && backend?.kind === 'azure_blob' && backend.sasToken && !backend.accountKey && !backend.connectionString) {
+  // A SAS token cannot sign new SAS URLs — whether passed alone or inside a
+  // connection string (`SharedAccessSignature=` with no `AccountKey=`).
+  // `UseDevelopmentStorage=true` is Azurite's shorthand; it carries the
+  // emulator's well-known account key, so it can sign.
+  const sasOnlyConnectionString =
+    backend?.kind === 'azure_blob' &&
+    !!backend.connectionString &&
+    !/(^|;)\s*(AccountKey\s*=|UseDevelopmentStorage\s*=\s*true)/i.test(backend.connectionString);
+  const sasOnly =
+    backend?.kind === 'azure_blob' && ((!!backend.sasToken && !backend.accountKey && !backend.connectionString) || sasOnlyConnectionString);
+  if (transfer === 'direct' && sasOnly) {
     invalid(`transfer (${ENV.transfer})`, '"direct" with storage "azure_blob" needs an account key or Entra ID to sign upload URLs; a SAS token cannot sign new ones');
   }
 

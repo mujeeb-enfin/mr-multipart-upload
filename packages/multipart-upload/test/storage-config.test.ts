@@ -119,6 +119,20 @@ describe('aws_s3', () => {
     );
   });
 
+  it('resolves credentials to a copy, so the SDK annotating it cannot change the configuration', () => {
+    // The AWS SDK writes `$source` into the credentials object it receives. When
+    // that was the caller's object, the next request's configuration differed
+    // from the cached one: a second S3 client, and the app's options modified.
+    // MUTATION: pass `credentials` through by reference -> the annotation shows
+    // up in the next resolution and the two cache keys differ.
+    const keys = { accessKeyId: 'AKIA', secretAccessKey: 'shh' };
+    const options = { storage: 'aws_s3' as const, s3: { ...S3, credentials: keys }, partBytes: 5 * MIB };
+    const first = resolve(options).backend as { credentials: Record<string, unknown> };
+    first.credentials.$source = { CREDENTIALS_CODE: 'e' }; // what the SDK does to the object it is given
+    expect(keys).toEqual({ accessKeyId: 'AKIA', secretAccessKey: 'shh' });
+    expect(JSON.stringify(resolve(options).backend)).not.toContain('$source');
+  });
+
   it('enforces S3 part limits against the configured sizes', () => {
     expect(message(() => resolve({ storage: 'aws_s3', s3: S3, partBytes: 2 * MIB }))).toBe(
       'partBytes (MULTIPART_UPLOAD_PART_BYTES) must be at least 5242880 (5 MiB) for storage "aws_s3": S3 refuses smaller parts',
@@ -184,6 +198,15 @@ describe('azure_blob', () => {
         resolve({ storage: 'azure_blob', transfer: 'direct', azure: { container: 'uploads', accountUrl: 'https://acct.blob.core.windows.net', sasToken: 'sv=x' } }),
       ),
     ).toContain('needs an account key or Entra ID to sign upload URLs');
+  });
+
+  it('refuses direct transfer with a SAS-only connection string, and accepts one with an account key', () => {
+    // Without this the server starts, then fails every signing request at runtime.
+    const sasOnly = 'BlobEndpoint=https://acct.blob.core.windows.net/;SharedAccessSignature=sv=x&sig=y';
+    expect(
+      message(() => resolve({ storage: 'azure_blob', transfer: 'direct', azure: { container: 'uploads', connectionString: sasOnly } })),
+    ).toContain('needs an account key or Entra ID to sign upload URLs');
+    expect(resolve({ storage: 'azure_blob', transfer: 'direct', azure: { container: 'uploads', connectionString: CS } }).transfer).toBe('direct');
   });
 
   it('enforces Azure\'s 50,000-block limit', () => {

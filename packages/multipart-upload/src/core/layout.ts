@@ -113,6 +113,16 @@ export function headKey(namespaceKey: string, uploadId: string): string {
   return `${sessionKey(namespaceKey, uploadId)}/${HEAD_FILE}`;
 }
 
+/**
+ * Azure direct transfer only: the blob the browser's SAS URLs write to. A
+ * write SAS covers the WHOLE blob it names (Put Blob too, not only Put Block),
+ * so it never names the final key; `commit` copies this blob there. Per session
+ * (`sessionId`), so an unexpired URL from an earlier session cannot reach it.
+ */
+export function directStagingKey(namespaceKey: string, uploadId: string, sessionId: string): string {
+  return `${sessionKey(namespaceKey, uploadId)}/direct-${sessionId}.bin`;
+}
+
 export function activityKey(namespaceKey: string, uploadId: string): string {
   return `${sessionKey(namespaceKey, uploadId)}/${ACTIVITY_FILE}`;
 }

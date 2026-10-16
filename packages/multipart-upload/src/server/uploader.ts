@@ -12,21 +12,21 @@ import { createHash } from 'node:crypto';
 import { expectedPartBytes, partCountFor } from '../core/arithmetic.js';
 import { UploadError } from '../core/errors.js';
 import { describeByteSize } from '../core/format.js';
-import { lockKey, manifestKey, namespaceDirKey, partKey, sessionKey } from '../core/layout.js';
+import { manifestKey, namespaceDirKey, partKey, sessionKey } from '../core/layout.js';
 import { type UploadManifest, type UploadMetadata, type UploadSession, summariseSession } from '../core/session.js';
 import { assertSafeUploadId } from '../core/slug.js';
 import { FsStorage } from '../storage/fs-storage.js';
 import type { DirectPartRequest } from '../storage/cloud/types.js';
 import { cloudBackendFor } from './cloud-backends.js';
 import {
-  cloudDestinationFor,
   cloudSweepRelease,
   completeCloudUpload,
   discardCloudUpload,
+  openCloudSession,
   presignCloudPart,
   storeCloudPart,
 } from './cloud-flow.js';
-import { completeUpload, DEFAULT_LOCK_STALE_MS, type CompleteHookInput, type CompleteResult } from './complete.js';
+import { completeUpload, DEFAULT_LOCK_STALE_MS, discardUnderLock, type CompleteHookInput, type CompleteResult } from './complete.js';
 import { type ConfigOverrides, type ResolvedConfig, resolveConfig } from './config.js';
 import { assertDeclaredTypeAllowed, declaredTypeFor } from './file-types.js';
 import { namespaceKeyFor, partTagFor, uploadIdFor } from './namespace.js';
@@ -58,9 +58,21 @@ export interface UploaderOptions extends ConfigOverrides, StorageOverrides {
    * Storage key for a completed file. Default (local):
    * `files/<namespace hash>/<sha256>.<ext>` — content-addressed and per-namespace.
    * Cloud backends call it when the upload BEGINS, before any byte exists, so
-   * `sha256` is '' there and the default is `files/<namespace hash>/<uploadId>.<ext>`.
+   * `sha256` is '' there and the default is
+   * `files/<namespace hash>/<uploadId>-<sessionId>.<ext>`. A cloud key MUST be
+   * unique per upload — build it from `sessionId` (or `uploadId` and
+   * `namespaceKey`); a commit onto an object this upload did not create is
+   * refused with DESTINATION_EXISTS.
    */
-  destination?: (info: { sha256: string; extension: string; namespaceKey: string; fileName: string; uploadId?: string }) => string;
+  destination?: (info: {
+    sha256: string;
+    extension: string;
+    namespaceKey: string;
+    fileName: string;
+    uploadId?: string;
+    /** Cloud only: random, minted per new upload session; kept on resume. */
+    sessionId?: string;
+  }) => string;
   /**
    * Remove expired unfinished uploads when a new one begins. Default: true for
    * local storage, false for cloud storage (where it would cost a request per
@@ -177,7 +189,8 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       const backend = await cloudBackendFor(storageConfig.backend);
       return { config, storageConfig, storage: backend.control, backend, namespaceKey };
     }
-    const storage = typeof options.storage === 'object' ? options.storage : new FsStorage(config.dir);
+    // `!= null`: a JavaScript caller's `storage: null` falls back to the filesystem, as in 0.2.
+    const storage = options.storage != null && typeof options.storage === 'object' ? options.storage : new FsStorage(config.dir);
     return { config, storageConfig, storage, namespaceKey };
   }
 
@@ -284,9 +297,10 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
 
     // Cloud: the provider's multipart session is opened first, because its id
     // (S3's UploadId) must be in the manifest. Its final key is fixed now.
-    const cloud = store.backend
-      ? await store.backend.createSession(cloudDestinationFor(store, options, uploadId, input.fileName), contentType)
-      : undefined;
+    const cloud = store.backend ? await openCloudSession(store, options, uploadId, input.fileName, contentType) : undefined;
+    const dropCloudSession = async () => {
+      if (cloud && store.backend) await store.backend.abortSession(cloud).catch(() => undefined);
+    };
 
     const manifest: UploadManifest = {
       v: 1,
@@ -304,15 +318,18 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
       ...(cloud ? { cloud } : {}),
     };
 
-    const outcome = await store.storage.createExclusive(
-      manifestKey(store.namespaceKey, uploadId),
-      JSON.stringify(manifest, null, 2),
-    );
+    // A provider session no manifest references would be billed until a
+    // lifecycle rule removes it, so it is dropped on every path that loses it.
+    const outcome = await store.storage
+      .createExclusive(manifestKey(store.namespaceKey, uploadId), JSON.stringify(manifest, null, 2))
+      .catch(async (err: unknown) => {
+        await dropCloudSession();
+        throw err;
+      });
     if (outcome === 'exists') {
       // Another request created it between the read and the write. Take the
-      // resume path rather than overwriting someone else's session — and drop
-      // the provider session this request opened, which nothing references.
-      if (cloud && store.backend) await store.backend.abortSession(cloud).catch(() => undefined);
+      // resume path rather than overwriting someone else's session.
+      await dropCloudSession();
       const raced = await readManifest(store, uploadId);
       if (raced) return resume(raced);
       throw new UploadError('NAME_IN_USE', 'Another request is starting this upload right now. Retry.', { uploadId });
@@ -333,7 +350,8 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     // with the wrong content — which a WebKit build was found doing in testing:
     // every part carried part 1's bytes, every size check passed, and the upload
     // "succeeded". The client's checksum turns that into a loud, retryable error.
-    const actual = createHash('sha256').update(bytes).digest('hex');
+    // Hashed when it is checked or needed: cloud storage records every part's SHA-256.
+    const actual = input.sha256 !== undefined || store.backend ? createHash('sha256').update(bytes).digest('hex') : '';
     if (input.sha256 !== undefined && actual !== input.sha256) {
       throw new UploadError(
         'PART_CHECKSUM_MISMATCH',
@@ -471,15 +489,9 @@ export function createUploader(options: UploaderOptions = {}): Uploader {
     discard: async (ctx, uploadId) => {
       const store = await contextFor(ctx);
       const id = checkedId(uploadId);
-      // Deleting the parts while `complete` is streaming them would turn a
-      // successful finish into a half-assembled failure. A lock older than
-      // lockStaleMs belonged to a process that died, and is ignored.
-      const lock = await store.storage.stat(lockKey(store.namespaceKey, id));
-      if (lock && Date.now() - lock.modifiedMs < (options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS)) {
-        throw new UploadError('COMPLETE_IN_PROGRESS', 'This upload is being finalised and cannot be discarded now.');
-      }
-      if (store.backend) await discardCloudUpload(store, id);
-      else await store.storage.removeTree(sessionKey(store.namespaceKey, id));
+      await discardUnderLock(store, id, options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS, () =>
+        store.backend ? discardCloudUpload(store, id) : store.storage.removeTree(sessionKey(store.namespaceKey, id)),
+      );
     },
     // The sweep spans every namespace; the namespace key here is unused.
     sweep: async () => sweepFor(await storeFor('')),

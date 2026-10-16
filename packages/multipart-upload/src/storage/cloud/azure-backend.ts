@@ -23,6 +23,7 @@ import { Readable } from 'node:stream';
 import type * as AzureBlob from '@azure/storage-blob';
 import type * as AzureIdentity from '@azure/identity';
 
+import { UploadError } from '../../core/errors.js';
 import type { CloudSessionRef } from '../../core/session.js';
 import type { StorageAdapter, StoredObjectInfo } from '../adapter.js';
 import { azureBlockId, compositeSha256, parseAzureBlockId } from './checksums.js';
@@ -218,34 +219,132 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
   const usesEntraId = !config.connectionString && !config.accountKey && !config.sasToken;
   const isHttp = (config.accountUrl ?? container.url).startsWith('http:');
 
+  // Parts go to the staging blob when the session has one (direct transfer).
+  const partsBlob = (session: CloudSessionRef) => blob(session.stagingKey ?? session.key);
+
   let delegation: { key: AzureBlob.UserDelegationKey; validUntil: number } | undefined;
-  async function signingKey(): Promise<AzureBlob.StorageSharedKeyCredential | AzureBlob.UserDelegationKey> {
-    if (sharedKey) return sharedKey;
-    // User delegation keys are valid for up to 7 days; one is fetched per hour.
-    if (!delegation || delegation.validUntil < Date.now() + 10 * 60_000) {
-      const startsOn = new Date(Date.now() - 5 * 60_000);
-      const expiresOn = new Date(Date.now() + 60 * 60_000);
-      delegation = { key: await service.getUserDelegationKey(startsOn, expiresOn), validUntil: expiresOn.getTime() };
+  const KEY_MARGIN_MS = 5 * 60_000;
+  // Azure's limit is 7 days; asked for a little less, so a local clock running
+  // ahead of Azure's does not get the request refused.
+  const KEY_MAX_MS = 7 * 24 * 3_600_000 - 2 * KEY_MARGIN_MS;
+  /**
+   * The key a SAS meant to last until `wantedExpiry` is signed with, and the
+   * latest expiry it can carry. Azure refuses a user delegation SAS once its KEY
+   * has expired, whatever the SAS says, so the SAS never outlives the key: the
+   * key is fetched to cover the SAS (at least an hour, at most KEY_MAX_MS) and
+   * reused while it still does. A shared key never expires.
+   */
+  async function signingKey(wantedExpiry: Date) {
+    if (sharedKey) return { key: sharedKey, latestExpiry: wantedExpiry };
+    const now = Date.now();
+    const needed = Math.min(wantedExpiry.getTime() + KEY_MARGIN_MS, now + KEY_MAX_MS - KEY_MARGIN_MS);
+    if (!delegation || delegation.validUntil < needed) {
+      const validUntil = Math.min(now + KEY_MAX_MS, Math.max(now + 3_600_000, wantedExpiry.getTime() + 3 * KEY_MARGIN_MS));
+      delegation = { key: await service.getUserDelegationKey(new Date(now - KEY_MARGIN_MS), new Date(validUntil)), validUntil };
     }
-    return delegation.key;
+    return { key: delegation.key, latestExpiry: new Date(Math.min(wantedExpiry.getTime(), delegation.validUntil - KEY_MARGIN_MS)) };
+  }
+
+  /**
+   * A SAS query string for one blob, signed by the account key or a user
+   * delegation key, and the expiry it actually carries (never past its key's).
+   */
+  async function blobSas(blobName: string, permissions: string, wantedExpiry: Date): Promise<{ sas: string; expiresOn: Date }> {
+    const { key, latestExpiry: expiresOn } = await signingKey(wantedExpiry);
+    const values: AzureBlob.BlobSASSignatureValues = {
+      containerName: config.container,
+      blobName,
+      permissions: sdk.BlobSASPermissions.parse(permissions),
+      // Started 5 minutes back to tolerate clock skew.
+      startsOn: new Date(Date.now() - 5 * 60_000),
+      expiresOn,
+      protocol: isHttp ? sdk.SASProtocol.HttpsAndHttp : sdk.SASProtocol.Https,
+    };
+    const sas = (
+      key instanceof sdk.StorageSharedKeyCredential
+        ? sdk.generateBlobSASQueryParameters(values, key) // service SAS (account key)
+        : sdk.generateBlobSASQueryParameters(values, key, accountName) // user delegation SAS (Entra ID)
+    ).toString();
+    return { sas, expiresOn };
   }
 
   async function listParts(session: CloudSessionRef): Promise<CloudPart[]> {
     let list: AzureBlob.BlockBlobGetBlockListResponse;
     try {
-      list = await blob(session.key).getBlockList('uncommitted');
+      // A staging blob's COMMITTED blocks are this upload's parts too: a commit
+      // that stopped before its copy to the final key leaves them there, and the
+      // retry must find them to commit and copy again. On a final-key blob the
+      // committed blocks are a stored file, and only uncommitted ones count.
+      list = await partsBlob(session).getBlockList(session.stagingKey ? 'all' : 'uncommitted');
     } catch (err) {
       if (statusOf(err) === 404) return [];
       throw err;
     }
     // The same index staged twice (a retry with other bytes) leaves two blocks;
-    // the most recently listed one wins, as a re-sent S3 part replaces the last.
+    // the later one listed wins. Uncommitted blocks are listed after committed.
     const byIndex = new Map<number, CloudPart>();
-    for (const block of list.uncommittedBlocks ?? []) {
+    for (const block of [...(list.committedBlocks ?? []), ...(list.uncommittedBlocks ?? [])]) {
       const parsed = parseAzureBlockId(block.name);
       if (parsed) byIndex.set(parsed.index, { index: parsed.index, size: block.size, sha256: parsed.sha256 });
     }
     return [...byIndex.values()].sort((a, b) => a.index - b.index);
+  }
+
+  /**
+   * Longest a `complete` waits for Azure's copy. Same-account copies normally
+   * finish at once, but Azure does not promise it; this stays well under the
+   * 15-minute complete lock, so the lock cannot go stale under a running copy.
+   */
+  const COPY_DEADLINE_MS = 10 * 60_000;
+
+  /**
+   * Direct transfer: copy the committed staging blob to the final key with the
+   * server's own credentials. The final key never had a SAS, so what the content
+   * check reads there afterwards is what stays stored.
+   */
+  async function copyToFinal(
+    session: CloudSessionRef & { stagingKey: string },
+    stagingEtag: string | undefined,
+    contentType: string,
+    checksum: CloudCommitResult['checksum'],
+  ): Promise<CloudCommitResult> {
+    const staging = blob(session.stagingKey);
+    const final = blob(session.key);
+    const { sas } = await blobSas(`${config.prefix}${session.stagingKey}`, 'r', new Date(Date.now() + COPY_DEADLINE_MS + 3_600_000));
+    // Only the blob just committed: the browser's SAS is still valid, and if it
+    // replaced the staging blob since, the copy fails (412) instead of storing
+    // other bytes.
+    const poller = await final.beginCopyFromURL(`${staging.url}?${sas}`, {
+      intervalInMs: 1000,
+      ...(stagingEtag ? { sourceConditions: { ifMatch: stagingEtag } } : {}),
+    });
+    let copied: AzureBlob.BlobBeginCopyFromURLResponse;
+    // This SDK's poller takes no abort signal, so the deadline is a race with
+    // the signal's abort event.
+    const deadline = AbortSignal.timeout(COPY_DEADLINE_MS);
+    const expired = new Promise<never>((_, reject) => {
+      deadline.addEventListener('abort', () => reject(new Error('Azure copy to the final key did not finish in time')), { once: true });
+    });
+    expired.catch(() => undefined); // only ever observed through the race below
+    try {
+      copied = await Promise.race([poller.pollUntilDone(), expired]);
+    } catch (err) {
+      poller.stopPolling();
+      // A copy still pending would make the retry's own copy fail (409).
+      const copyId = poller.getOperationState().result?.copyId;
+      if (copyId) await final.abortCopyFromURL(copyId).catch(() => undefined);
+      throw err;
+    }
+    if (copied.copyStatus !== 'success') throw new Error(`Azure copy to the final key ended "${copied.copyStatus ?? 'unknown'}"`);
+    // A copy carries the source's properties, and the browser's SAS can set the
+    // staging blob's: the stored file's type is the server's again.
+    await final.setHTTPHeaders({ blobContentType: contentType });
+    // The size is the COPY's, not the parts' sum.
+    const size = (await final.getProperties()).contentLength ?? 0;
+    // The file is stored; a staging blob left behind lies inside the session
+    // directory, which complete, discard and the sweep all remove.
+    await staging.deleteIfExists().catch(() => undefined);
+    return { key: session.key, size, checksum };
   }
 
   return {
@@ -254,16 +353,21 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
     directChecksums: ['sha256', 'md5'],
     supportsDirect: Boolean(sharedKey) || usesEntraId,
 
-    async createSession(key) {
-      return { kind: 'azure_blob', key };
+    async createSession(key, _contentType, stagingKey) {
+      return { kind: 'azure_blob', key, ...(stagingKey ? { stagingKey } : {}) };
     },
 
     async abortSession(session) {
+      // A staging blob is this session's alone, committed or not.
+      if (session.stagingKey) {
+        await blob(session.stagingKey).deleteIfExists();
+        return;
+      }
       const target = blob(session.key);
-      // A COMMITTED blob at the key is a stored file — an earlier upload of the
-      // same file shares the key — and must survive. exists() is false while the
-      // blob holds only uncommitted blocks; Azure drops those left on a committed
-      // blob at its next commit, or after 7 days.
+      // A COMMITTED blob at the final key is a stored file and must survive —
+      // keys are unique per session, but a custom destination() may not be.
+      // exists() is false while the blob holds only uncommitted blocks; Azure
+      // drops those left on a committed blob at its next commit, or after 7 days.
       if (await target.exists()) return;
       // Deleting the blob discards its uncommitted blocks with it.
       await target.deleteIfExists();
@@ -272,28 +376,22 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
     async putPart(session, index, bytes, sha256) {
       const body = toBuffer(bytes);
       const md5 = createHash('md5').update(body).digest();
-      await blob(session.key).stageBlock(azureBlockId(index, sha256), body, body.byteLength, { transactionalContentMD5: md5 });
+      await partsBlob(session).stageBlock(azureBlockId(index, sha256), body, body.byteLength, { transactionalContentMD5: md5 });
     },
 
     async presignPart(session, index, _length, sha256, md5Base64, ttlSeconds): Promise<DirectPartRequest> {
       if (!md5Base64) throw new Error('Azure direct parts need an MD5');
-      const target = blob(session.key);
-      const expiresOn = new Date(Date.now() + ttlSeconds * 1000);
-      const key = await signingKey();
-      const values: AzureBlob.BlobSASSignatureValues = {
-        containerName: config.container,
-        blobName: `${config.prefix}${session.key}`,
-        // Write only, one blob, short-lived. Started 5 minutes back to tolerate clock skew.
-        permissions: sdk.BlobSASPermissions.parse('w'),
-        startsOn: new Date(Date.now() - 5 * 60_000),
-        expiresOn,
-        protocol: isHttp ? sdk.SASProtocol.HttpsAndHttp : sdk.SASProtocol.Https,
-      };
-      const sas = (
-        key instanceof sdk.StorageSharedKeyCredential
-          ? sdk.generateBlobSASQueryParameters(values, key) // service SAS (account key)
-          : sdk.generateBlobSASQueryParameters(values, key, accountName) // user delegation SAS (Entra ID)
-      ).toString();
+      // A write SAS can replace the WHOLE blob it names (Put Blob, not only Put
+      // Block), so it must never name the final key — only the staging blob.
+      if (!session.stagingKey) {
+        throw new UploadError(
+          'INVALID_REQUEST',
+          'This upload was started before direct transfer applied to it and cannot continue that way. Discard it and upload the file again.',
+        );
+      }
+      const target = blob(session.stagingKey);
+      // Write only, one blob, short-lived — and never past its signing key.
+      const { sas, expiresOn } = await blobSas(`${config.prefix}${session.stagingKey}`, 'w', new Date(Date.now() + ttlSeconds * 1000));
       const blockId = encodeURIComponent(azureBlockId(index, sha256));
       return {
         url: `${target.url}?comp=block&blockid=${blockId}&${sas}`,
@@ -307,15 +405,13 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
 
     async commit(session, parts, contentType): Promise<CloudCommitResult> {
       const ordered = [...parts].sort((a, b) => a.index - b.index);
-      await blob(session.key).commitBlockList(
+      const committedBlocks = await partsBlob(session).commitBlockList(
         ordered.map((p) => azureBlockId(p.index, p.sha256 as string)),
         { blobHTTPHeaders: { blobContentType: contentType } },
       );
-      return {
-        key: session.key,
-        size: ordered.reduce((sum, p) => sum + p.size, 0),
-        checksum: compositeSha256(ordered.map((p) => p.sha256)),
-      };
+      const checksum = compositeSha256(ordered.map((p) => p.sha256));
+      if (!session.stagingKey) return { key: session.key, size: ordered.reduce((sum, p) => sum + p.size, 0), checksum };
+      return copyToFinal(session as CloudSessionRef & { stagingKey: string }, committedBlocks.etag, contentType, checksum);
     },
 
     readObjectHead: (key, byteCount) => control.readHead(key, byteCount),

@@ -16,11 +16,23 @@ import type { CloudBackend } from '../storage/cloud/types.js';
 
 const cache = new Map<string, Promise<CloudBackend>>();
 
+/**
+ * Bounded: credentials rotated through options (a new STS session token per
+ * deploy, say) produce a new configuration each time, and an unbounded cache
+ * would keep every superseded client alive. The least recently used goes first.
+ */
+const MAX_CACHED_BACKENDS = 8;
+
 export function cloudBackendFor(config: S3BackendConfig | AzureBackendConfig): Promise<CloudBackend> {
   // The key holds credentials, in memory only; it is never logged or returned.
   const key = JSON.stringify(config);
   let backend = cache.get(key);
-  if (!backend) {
+  if (backend) {
+    // Re-inserted, so Map order is least recently used first.
+    cache.delete(key);
+    cache.set(key, backend);
+  } else {
+    if (cache.size >= MAX_CACHED_BACKENDS) cache.delete(cache.keys().next().value as string);
     backend = (async () => {
       if (config.kind === 'azure_blob') {
         const { createAzureBackend } = await import('../storage/cloud/azure-backend.js');
@@ -30,7 +42,11 @@ export function cloudBackendFor(config: S3BackendConfig | AzureBackendConfig): P
       return createS3Backend(config);
     })();
     cache.set(key, backend);
-    backend.catch(() => cache.delete(key));
+    // Only THIS entry: after an eviction a newer one may be cached under the key.
+    const created = backend;
+    created.catch(() => {
+      if (cache.get(key) === created) cache.delete(key);
+    });
   }
   return backend;
 }

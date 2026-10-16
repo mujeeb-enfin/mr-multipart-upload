@@ -19,8 +19,9 @@ import { patternBytes } from './helpers.js';
 
 describe('browser MD5 (Azure Content-MD5)', () => {
   it('matches Node\'s MD5 at every length around the padding boundaries and beyond', () => {
-    // MUTATION: drop the high word of the bit length -> inputs of 512 MiB+ differ;
-    // a wrong round constant or shift -> every case below differs.
+    // MUTATION: a wrong round constant, shift or padding rule -> the cases below
+    // differ. (The bit length's HIGH word only matters from 512 MiB, far above
+    // the 8 MiB part cap, so it is not exercised here.)
     const lengths = [0, 1, 3, 54, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 1000, 4096, 65_537, 5 * 1024 * 1024];
     for (const length of lengths) {
       const bytes = patternBytes(length, length + 1);

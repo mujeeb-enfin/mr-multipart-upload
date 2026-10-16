@@ -109,7 +109,9 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — proxy transfer', () 
         deduplicated: false,
         checksum: { type: 'sha256-composite', value: expectedComposite(bytes, CLOUD_PART_BYTES), parts: 3 },
       });
-      expect(done.key).toMatch(new RegExp(`^files/[0-9a-f]{32}/${begun.session.manifest.uploadId}\\.png$`));
+      // <namespace hash>/<upload id>-<session id>: unique per session, fixed at begin.
+      expect(done.key).toMatch(new RegExp(`^files/[0-9a-f]{32}/${begun.session.manifest.uploadId}-[0-9a-f]{16}\\.png$`));
+      expect(done.key).toBe(begun.session.manifest.cloud?.key);
       // Nothing left behind: no control files, no open multipart session.
       expect(await up.list(ALICE)).toEqual([]);
       if (kind !== 'azure_blob') expect(await openS3MultipartUploads(bucket)).toBe(0);
@@ -231,6 +233,66 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — proxy transfer', () 
       expect(sha256(await readAll(backend.openRead(retried.key)))).toBe(sha256(bytes));
     });
 
+    it('a reload after the commit resumes with nothing to send, and complete finishes the file', async () => {
+      // The provider consumed the parts at commit, so none can be sent again (S3
+      // refuses parts of a completed upload, and a committed manifest refuses
+      // them here). A reload that reported them missing would strand the file.
+      // MUTATION: drop both "every part" branches of listVerifiedCloudParts ->
+      // the resumed begin reports every part missing. (Either branch alone
+      // covers this case: a committed file also carries the commit marker.)
+      let calls = 0;
+      const up = uploader({
+        onComplete: () => {
+          calls += 1;
+          if (calls === 1) throw new Error('database down');
+          return { saved: true };
+        },
+      });
+      const bytes = fileOf(SIZE, 27);
+      const input = { fileName: 'reload.bin', totalBytes: SIZE, fingerprint: 'fp-reload' };
+      const begun = await up.begin(ALICE, input);
+      await sendParts(up, ALICE, begun.session.manifest.uploadId, bytes, 'fp-reload', partsOf(SIZE));
+      await expect(up.complete(ALICE, begun.session.manifest.uploadId)).rejects.toThrow('database down');
+
+      const reloaded = await up.begin(ALICE, input); // the page reloads and the file is picked again
+      expect(reloaded.created).toBe(false);
+      expect(reloaded.session.missingParts).toEqual([]);
+      expect(reloaded.session.receivedBytes).toBe(SIZE);
+      const done = await up.complete(ALICE, begun.session.manifest.uploadId);
+      expect(done).toMatchObject({ result: { saved: true }, size: SIZE });
+      const backend = await backendFor(base());
+      expect(sha256(await readAll(backend.openRead(done.key)))).toBe(sha256(bytes));
+    });
+
+    it('a cleanup that fails after onComplete never lets a later discard delete the recorded file', async () => {
+      // While the manifest exists, discard reads `committed` and deletes the
+      // file. complete therefore removes the manifest FIRST; the rest of the
+      // session directory failing to go must leave the app's file alone.
+      // MUTATION: remove the manifest only through removeTree (as before) ->
+      // the failed cleanup leaves it, and the discard deletes the stored file.
+      const up = uploader({ onComplete: () => ({ saved: true }) });
+      const bytes = fileOf(SIZE, 28);
+      const begun = await up.begin(ALICE, { fileName: 'kept.bin', totalBytes: SIZE, fingerprint: 'fp-cleanup' });
+      const id = begun.session.manifest.uploadId;
+      await sendParts(up, ALICE, id, bytes, 'fp-cleanup', partsOf(SIZE));
+
+      const backend = await backendFor(base()); // the uploader's own (cached) backend
+      const control = backend.control;
+      const realRemoveTree = control.removeTree.bind(control);
+      Object.assign(control, { removeTree: async () => Promise.reject(new Error('storage unavailable')) });
+      let done: Awaited<ReturnType<Uploader['complete']>>;
+      try {
+        done = await up.complete(ALICE, id);
+      } finally {
+        Object.assign(control, { removeTree: realRemoveTree });
+      }
+      expect(done).toMatchObject({ result: { saved: true }, size: SIZE });
+
+      await up.discard(ALICE, id); // e.g. the user clicks cancel on a stale tab
+      expect(sha256(await readAll(backend.openRead(done.key)))).toBe(sha256(bytes));
+      await backend.deleteObject(done.key);
+    });
+
     it('finishes an upload whose commit happened but was never recorded (a crash mid-complete)', async () => {
       // The provider consumes the parts on commit. If the server stops before
       // recording it, a retry finds no parts — and without recovery would
@@ -243,6 +305,11 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — proxy transfer', () 
       const id = begun.session.manifest.uploadId;
       await sendParts(up, ALICE, id, bytes, 'fp-crash', partsOf(SIZE));
       const { backend } = await commitThenCrash(begun.session.manifest);
+
+      // A reload after the crash: nothing left to send, straight to complete.
+      // MUTATION: drop the commit-marker branch of listVerifiedCloudParts -> every part reported missing.
+      const reloaded = await up.begin(ALICE, { fileName: 'crash.bin', totalBytes: SIZE, fingerprint: 'fp-crash' });
+      expect(reloaded.session.missingParts).toEqual([]);
 
       const done = await up.complete(ALICE, id);
       expect(done).toMatchObject({ size: SIZE, checksum: null }); // the composite is not recoverable after the fact
@@ -265,24 +332,59 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — proxy transfer', () 
       expect(await code(up.status(ALICE, begun.session.manifest.uploadId))).toBe('NO_SESSION');
     });
 
-    it('a re-upload of an already stored file neither claims nor deletes the earlier copy', async () => {
-      // The same file gets the same upload id, so the same final key. With no
-      // commit marker, the object there is the EARLIER upload's.
-      // MUTATION: drop the commitStartedAt check in interruptedCommit -> complete
-      // "succeeds" with no parts sent, and discard deletes the stored file.
-      const up = uploader();
+    it('a re-upload of an already stored file gets its own key; refusing or discarding it keeps the earlier copy', async () => {
+      // The same file gets the same upload id. If it also got the same storage
+      // key, a re-upload would commit over — and, refused after the commit
+      // (direct transfer), delete — the earlier copy. With proxy transfer the
+      // refusal comes before any commit, so here the key itself is the evidence.
+      // MUTATION: drop "-<sessionId>" from the default key -> `not.toBe(stored.key)` fails.
+      const refuseSecond = { validateHead: (_head: Uint8Array, info: { metadata: unknown }) => {
+        if ((info.metadata as { attempt?: number } | null)?.attempt === 2) throw new Error('second attempt refused');
+      } };
+      const up = uploader(refuseSecond);
       const bytes = fileOf(SIZE, 24);
-      const first = await up.begin(ALICE, { fileName: 'again.bin', totalBytes: SIZE, fingerprint: 'fp-again' });
+      const first = await up.begin(ALICE, { fileName: 'again.bin', totalBytes: SIZE, fingerprint: 'fp-again', metadata: { attempt: 1 } });
       await sendParts(up, ALICE, first.session.manifest.uploadId, bytes, 'fp-again', partsOf(SIZE));
       const stored = await up.complete(ALICE, first.session.manifest.uploadId);
 
-      const again = await up.begin(ALICE, { fileName: 'again.bin', totalBytes: SIZE, fingerprint: 'fp-again' });
-      expect(again.session.manifest.cloud?.key).toBe(stored.key);
+      // Resume keeps the key — only a NEW session mints one.
+      const again = await up.begin(ALICE, { fileName: 'again.bin', totalBytes: SIZE, fingerprint: 'fp-again', metadata: { attempt: 2 } });
+      const resumed = await up.begin(ALICE, { fileName: 'again.bin', totalBytes: SIZE, fingerprint: 'fp-again', metadata: { attempt: 2 } });
+      expect(again.session.manifest.uploadId).toBe(first.session.manifest.uploadId);
+      expect(again.session.manifest.cloud?.key).not.toBe(stored.key);
+      expect(resumed.session.manifest.cloud?.key).toBe(again.session.manifest.cloud?.key);
       expect(await code(up.complete(ALICE, again.session.manifest.uploadId))).toBe('INCOMPLETE');
+
+      await sendParts(up, ALICE, again.session.manifest.uploadId, bytes, 'fp-again', partsOf(SIZE));
+      expect(await code(up.complete(ALICE, again.session.manifest.uploadId))).toBe('REJECTED');
       await up.discard(ALICE, again.session.manifest.uploadId);
 
       const backend = await backendFor(base());
       expect(sha256(await readAll(backend.openRead(stored.key)))).toBe(sha256(bytes));
+      expect(await backend.control.stat(again.session.manifest.cloud?.key as string)).toBeNull();
+    });
+
+    it('never commits over an object it did not create (a destination() that is not unique)', async () => {
+      // MUTATION: drop the DESTINATION_EXISTS check -> the second upload
+      // overwrites the first user's file.
+      const shared = { destination: ({ extension }: { extension: string }) => `shared/one-key.${extension}` };
+      const up = uploader(shared);
+      const alices = fileOf(SIZE, 25);
+      const bobs = fileOf(SIZE, 26);
+      const a = await up.begin(ALICE, { fileName: 'mine.bin', totalBytes: SIZE, fingerprint: 'fp-shared-a' });
+      await sendParts(up, ALICE, a.session.manifest.uploadId, alices, 'fp-shared-a', partsOf(SIZE));
+      const stored = await up.complete(ALICE, a.session.manifest.uploadId);
+
+      const b = await up.begin(BOB, { fileName: 'mine.bin', totalBytes: SIZE, fingerprint: 'fp-shared-b' });
+      await sendParts(up, BOB, b.session.manifest.uploadId, bobs, 'fp-shared-b', partsOf(SIZE));
+      expect(await code(up.complete(BOB, b.session.manifest.uploadId))).toBe('DESTINATION_EXISTS');
+
+      const backend = await backendFor(base());
+      expect(sha256(await readAll(backend.openRead(stored.key)))).toBe(sha256(alices));
+      expect((await up.status(BOB, b.session.manifest.uploadId)).missingParts).toEqual([]); // parts kept
+      await up.discard(BOB, b.session.manifest.uploadId);
+      expect(sha256(await readAll(backend.openRead(stored.key)))).toBe(sha256(alices)); // discard keeps it too
+      await backend.deleteObject(stored.key);
     });
 
     it('discard releases the provider session: no parts, no control files, nothing open', async () => {

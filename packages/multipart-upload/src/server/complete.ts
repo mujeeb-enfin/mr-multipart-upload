@@ -98,7 +98,34 @@ export function extensionOf(fileName: string): string {
   return /^[a-z0-9]{1,16}$/.test(ext) ? ext : '';
 }
 
-async function acquireLock(store: StoreContext, uploadId: string, staleMs: number): Promise<void> {
+/**
+ * Discard under the `complete` lock. Deleting the parts while `complete` is
+ * using them would turn a successful finish into a half-assembled failure, so
+ * discard TAKES the lock rather than only looking for it: a complete starting
+ * between a look and the delete would otherwise race it. A lock older than
+ * `staleMs` belonged to a process that died, and is taken over. `remove`
+ * deletes the session (and, for cloud storage, the provider's side).
+ */
+export async function discardUnderLock(store: StoreContext, uploadId: string, staleMs: number, remove: () => Promise<void>): Promise<void> {
+  try {
+    await acquireLock(store, uploadId, staleMs);
+  } catch (err) {
+    if (err instanceof UploadError && err.code === 'COMPLETE_IN_PROGRESS') {
+      throw new UploadError('COMPLETE_IN_PROGRESS', 'This upload is being finalised and cannot be discarded now.');
+    }
+    throw err;
+  }
+  try {
+    await remove();
+  } catch (err) {
+    // The session survives a failed discard; its lock must not block it.
+    await store.storage.remove(lockKey(store.namespaceKey, uploadId)).catch(() => undefined);
+    throw err;
+  }
+}
+
+/** The single-flight lock `complete` holds — and `discard` takes, so the two never overlap. */
+export async function acquireLock(store: StoreContext, uploadId: string, staleMs: number): Promise<void> {
   const key = lockKey(store.namespaceKey, uploadId);
   const stamp = new Date().toISOString();
   if ((await store.storage.createExclusive(key, stamp)) === 'created') return;
@@ -107,6 +134,9 @@ async function acquireLock(store: StoreContext, uploadId: string, staleMs: numbe
   // the upload could never be finished. One older than `staleMs` is taken over;
   // assembling even a multi-gigabyte file takes seconds, not minutes.
   const info = await store.storage.stat(key);
+  // No lock after all: it was released between the two calls (S3 also reports
+  // a write that raced a delete as a conflict). Asked once more.
+  if (!info && (await store.storage.createExclusive(key, stamp)) === 'created') return;
   if (info && Date.now() - info.modifiedMs > staleMs) {
     await store.storage.remove(key);
     if ((await store.storage.createExclusive(key, stamp)) === 'created') return;

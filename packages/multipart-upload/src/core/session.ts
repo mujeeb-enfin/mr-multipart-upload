@@ -63,18 +63,23 @@ export interface UploadManifest {
   /**
    * Cloud backends only: written just BEFORE the provider commit. If the server
    * stops between that commit and recording `committed`, this marker is what
-   * shows the object at the final key came from this upload — and not from an
-   * earlier, completed upload of the same file, which shares the key.
+   * shows the object at the final key came from this upload — and not from a
+   * custom `destination()` that gave another upload the same key.
    */
   readonly commitStartedAt?: string;
 }
 
 export interface CloudSessionRef {
   readonly kind: 'aws_s3' | 'minio' | 'azure_blob';
-  /** Object key / blob name of the final file, fixed when the session begins. */
+  /**
+   * Object key / blob name of the final file, fixed when the session begins and
+   * unique to the session, so resuming keeps it and a new upload never shares it.
+   */
   readonly key: string;
   /** S3 / MinIO multipart UploadId. Absent for Azure. */
   readonly uploadId?: string;
+  /** Azure direct transfer: the blob the browser writes to, copied to `key` at commit. */
+  readonly stagingKey?: string;
 }
 
 export interface FileChecksum {

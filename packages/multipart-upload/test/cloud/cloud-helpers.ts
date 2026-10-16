@@ -59,6 +59,12 @@ export function storageOptions(kind: CloudKind, bucket: string, extra: StorageOv
   return { ...base, azure: { container: bucket, connectionString: azureConnection as string } };
 }
 
+/** A raw Azure blob client, to set up provider state a test needs (azure_blob only). */
+export async function azureBlob(container: string, name: string) {
+  const { BlobServiceClient } = await import('@azure/storage-blob');
+  return BlobServiceClient.fromConnectionString(azureConnection as string).getContainerClient(container).getBlockBlobClient(name);
+}
+
 /** The backend instance the uploader will use for these options. */
 export async function backendFor(options: StorageOverrides & { partBytes?: number; maxFileBytes?: number }): Promise<CloudBackend> {
   const resolved = resolveStorage(options, resolveConfig(options));

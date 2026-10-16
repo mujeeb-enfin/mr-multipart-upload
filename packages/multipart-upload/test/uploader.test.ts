@@ -19,6 +19,8 @@ import { UploadError } from '../src/core/errors.js';
 import { lockKey, partKey, sessionKey } from '../src/core/layout.js';
 import { namespaceKeyFor, partTagFor } from '../src/server/namespace.js';
 import { createUploader, type Uploader, type UploaderOptions } from '../src/server/uploader.js';
+import type { StorageAdapter } from '../src/storage/adapter.js';
+import { FsStorage } from '../src/storage/fs-storage.js';
 import { MIB, clearEnv, partOf, patternBytes, sha256, tempRoot } from './helpers.js';
 
 let root: string;
@@ -405,6 +407,39 @@ describe('complete', () => {
     const id = await fullUpload(up, ALICE, patternBytes(SIZE), 'f.bin');
     await writeFile(join(root, lockKey(namespaceKeyFor(ALICE.namespace), id)), 'busy');
     expect(await codeOf(up.discard(ALICE, id))).toBe('COMPLETE_IN_PROGRESS');
+  });
+
+  it('holds the lock while it discards, so a complete starting meanwhile is refused', async () => {
+    // A discard that only LOOKED for the lock let a complete start between the
+    // look and the delete: one deleted the parts the other was assembling.
+    // MUTATION: replace discardUnderLock's acquireLock with a stat check -> the
+    // complete runs and finishes (or fails mid-assembly), not COMPLETE_IN_PROGRESS.
+    let releaseDelete!: () => void;
+    let deleteReached!: () => void;
+    const reached = new Promise<void>((r) => (deleteReached = r));
+    const gate = new Promise<void>((r) => (releaseDelete = r));
+    const inner = new FsStorage(root);
+    let gated = false;
+    const storage: StorageAdapter = Object.assign(Object.create(FsStorage.prototype), inner, {
+      async removeTree(key: string) {
+        // Only discard's delete is held; a complete that wrongly ran must finish.
+        if (!gated) {
+          gated = true;
+          deleteReached();
+          await gate;
+        }
+        return inner.removeTree(key);
+      },
+    });
+    const up = uploaderWith({ storage });
+    const id = await fullUpload(up, ALICE, patternBytes(SIZE), 'f.bin');
+
+    const discarding = up.discard(ALICE, id);
+    await reached; // discard is now deleting
+    expect(await codeOf(up.complete(ALICE, id))).toBe('COMPLETE_IN_PROGRESS');
+    releaseDelete();
+    await discarding;
+    expect(await codeOf(up.status(ALICE, id))).toBe('NO_SESSION');
   });
 
   it('rejects a complete for an upload that does not exist, without creating anything', async () => {

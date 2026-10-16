@@ -63,7 +63,13 @@ export type UploadErrorCode =
   /** No route matches the method and path. */
   | 'NOT_FOUND'
   /** Server configuration is invalid — an `.env` value or an option. */
-  | 'CONFIG_INVALID';
+  | 'CONFIG_INVALID'
+  /**
+   * Cloud storage: an object this upload did not create already exists at its
+   * storage key — usually a custom `destination()` that returns the same key for
+   * different uploads. Nothing is overwritten; the parts are kept.
+   */
+  | 'DESTINATION_EXISTS';
 
 const STATUS_FOR_CODE: Record<UploadErrorCode, number> = {
   NAME_IN_USE: 409,
@@ -90,6 +96,7 @@ const STATUS_FOR_CODE: Record<UploadErrorCode, number> = {
   UNAUTHORIZED: 401,
   NOT_FOUND: 404,
   CONFIG_INVALID: 500,
+  DESTINATION_EXISTS: 409,
 };
 
 export class UploadError extends Error {

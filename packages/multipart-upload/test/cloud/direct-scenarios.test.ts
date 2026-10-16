@@ -18,12 +18,17 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { fetchPartSender } from '../../src/client/transport.js';
 import { startUpload } from '../../src/client/upload.js';
 import { UploadError } from '../../src/core/errors.js';
+import { manifestKey } from '../../src/core/layout.js';
+import type { UploadManifest } from '../../src/core/session.js';
+import { namespaceKeyFor } from '../../src/server/namespace.js';
 import { createUploadRoutes } from '../../src/server/routes.js';
 import { createUploader, type Uploader, type UploaderOptions } from '../../src/server/uploader.js';
+import { azureBlockId } from '../../src/storage/cloud/checksums.js';
 import { clearEnv, partOf, patternBytes } from '../helpers.js';
 import {
   AVAILABLE,
   CLOUD_PART_BYTES,
+  azureBlob,
   backendFor,
   createBucket,
   deleteBucket,
@@ -48,12 +53,6 @@ function fileOf(size: number, seed: number, signature?: readonly number[]): Uint
   return bytes;
 }
 
-/**
- * The HTTP status, or 'reset' when the storage refused by closing the
- * connection before reading the body (VersityGW does so for an expired
- * signature; a browser sees a network error, which the client retries with a
- * fresh URL). Both are refusals; the tests then assert nothing was stored.
- */
 /** The UploadError code a promise rejects with, or 'resolved'. */
 function errorCode(promise: Promise<unknown>): Promise<string> {
   return promise.then(
@@ -62,6 +61,12 @@ function errorCode(promise: Promise<unknown>): Promise<string> {
   );
 }
 
+/**
+ * The HTTP status, or 'reset' when the storage refused by closing the
+ * connection before reading the body (VersityGW does so for an expired
+ * signature; a browser sees a network error, which the client retries with a
+ * fresh URL). Both are refusals; the tests then assert nothing was stored.
+ */
 async function put(url: string, headers: Record<string, string>, body: Uint8Array<ArrayBuffer>): Promise<number | 'reset'> {
   try {
     const res = await fetch(url, { method: 'PUT', headers, body });
@@ -98,6 +103,79 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — direct transfer', ()
     });
     afterAll(async () => {
       await deleteBucket(kind, bucket);
+    });
+
+    it('a part URL cannot replace the stored file after its content was checked', async () => {
+      // An Azure write SAS covers the WHOLE blob it names: with comp=block and
+      // blockid stripped it is a Put Blob, replacing the blob. Part URLs must
+      // therefore never name the final key (Azure: they name a staging blob).
+      // On S3 the stripped URL no longer matches its signature.
+      // MUTATION (the pre-fix design): no staging blob — openCloudSession passes
+      // no stagingKey and presignPart signs session.key -> the stored file
+      // becomes the attacker's bytes (verified: the hash assertion fails).
+      const up = uploader();
+      const bytes = fileOf(SIZE, 37);
+      const begun = await up.begin(ALICE, { fileName: 'kept.bin', totalBytes: SIZE, fingerprint: 'fp-kept' });
+      const id = begun.session.manifest.uploadId;
+      const part1 = partOf(bytes, 1, CLOUD_PART_BYTES);
+      const kept = await up.presignPart(ALICE, { uploadId: id, index: 1, fingerprint: 'fp-kept', sha256: sha256(part1), ...(needsMd5 ? { md5: md5b64(part1) } : {}) });
+      for (const index of [1, 2, 3]) expect([200, 201]).toContain(await sendDirect(up, id, 'fp-kept', bytes, index));
+      const done = await up.complete(ALICE, id);
+
+      const wholeObject = kept.url.replace(/([?&])(comp=block&blockid=[^&]*|partNumber=[^&]*|uploadId=[^&]*)&?/g, '$1');
+      const evil = new TextEncoder().encode('MZ-not-the-checked-file') as Uint8Array<ArrayBuffer>;
+      await put(wholeObject, { 'x-ms-version': '2025-01-05', 'x-ms-blob-type': 'BlockBlob' }, evil);
+
+      const backend = await backendFor(base());
+      expect(sha256(await readAll(backend.openRead(done.key)))).toBe(sha256(bytes));
+    });
+
+    it.runIf(kind === 'azure_blob')('a staged commit that stopped part-way is finished by a retry, or removed by a discard', async () => {
+      // Azure direct commits in three steps: commit the staging blob, copy it to
+      // the final key, delete the staging blob. A server can stop after the first
+      // (staging committed, final key empty) or the second (an unrecorded copy).
+      // MUTATIONS (each checked on its own):
+      //   listParts reading only 'uncommitted' for a staged session -> the retry
+      //     before the copy reports INCOMPLETE;
+      //   releaseCloudSession using ownCommittedObject for a staged session ->
+      //     the discard after the copy leaves it stored;
+      //   the DESTINATION_EXISTS check ignoring the marker -> the retry after
+      //     the copy is refused.
+      const endings = [
+        { stopped: 'before-copy', then: 'retry' },
+        { stopped: 'after-copy', then: 'retry' },
+        { stopped: 'after-copy', then: 'discard' },
+      ] as const;
+      for (const [n, { stopped, then }] of endings.entries()) {
+        const ending = `${stopped}-${then}`;
+        const up = uploader();
+        const bytes = fileOf(SIZE, 39 + n);
+        const fp = `fp-staged-${ending}`;
+        const begun = await up.begin(ALICE, { fileName: `staged-${ending}.bin`, totalBytes: SIZE, fingerprint: fp });
+        const id = begun.session.manifest.uploadId;
+        for (const index of [1, 2, 3]) expect([200, 201]).toContain(await sendDirect(up, id, fp, bytes, index));
+        const session = begun.session.manifest.cloud as NonNullable<UploadManifest['cloud']>;
+        expect(session.stagingKey).toBeDefined();
+
+        // What the stopped complete had done: marker, staging commit, copy.
+        const backend = await backendFor(base());
+        const marked = { ...begun.session.manifest, commitStartedAt: new Date().toISOString() };
+        await backend.control.write?.(manifestKey(namespaceKeyFor(ALICE.namespace), id), JSON.stringify(marked));
+        const staging = await azureBlob(bucket, session.stagingKey as string);
+        await staging.commitBlockList((await backend.listParts(session)).map((p) => azureBlockId(p.index, p.sha256 as string)));
+        if (stopped === 'after-copy') await (await azureBlob(bucket, session.key)).uploadData(await staging.downloadToBuffer());
+
+        if (then === 'retry') {
+          const done = await up.complete(ALICE, id);
+          expect(done.key).toBe(session.key);
+          expect(sha256(await readAll(backend.openRead(done.key)))).toBe(sha256(bytes));
+        } else {
+          await up.discard(ALICE, id);
+          expect(await backend.control.stat(session.key)).toBeNull();
+        }
+        expect(await staging.exists()).toBe(false);
+        expect(await errorCode(up.status(ALICE, id))).toBe('NO_SESSION');
+      }
     });
 
     it('uploads every part straight to the storage and commits it byte-for-byte', async () => {
@@ -191,6 +269,42 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — direct transfer', ()
       const backend = await backendFor(base());
       expect((await backend.readObjectHead(begun.session.manifest.cloud?.key as string, 16).catch(() => new Uint8Array(0))).byteLength).toBe(0);
       // This upload's session is gone too (asserted by id, independent of other tests).
+      expect(await errorCode(up.status(ALICE, id))).toBe('NO_SESSION');
+    });
+
+    it('keeps the session when deleting a refused file fails, so the file is still found and removed', async () => {
+      // The manifest is the only record of a committed-but-refused file. Dropping
+      // it after a failed delete left the file stored where nothing would ever
+      // find it again — not a retry, not discard, not the sweep.
+      // MUTATION: make deleteRefusedFile remove the session even when the delete
+      // failed -> status is NO_SESSION and the refused file stays stored.
+      const up = uploader({ allowedTypes: ['image/*'] });
+      const bytes = fileOf(SIZE, 38, EXE);
+      const begun = await up.begin(ALICE, { fileName: 'stuck.png', totalBytes: SIZE, fingerprint: 'fp-stuck', contentType: 'image/png' });
+      const id = begun.session.manifest.uploadId;
+      const key = begun.session.manifest.cloud?.key as string;
+      for (const index of [1, 2, 3]) await sendDirect(up, id, 'fp-stuck', bytes, index);
+
+      const backend = await backendFor(base()); // the uploader's own (cached) backend
+      const realDelete = backend.deleteObject;
+      let failedDeletes = 0;
+      Object.assign(backend, {
+        deleteObject: async () => {
+          failedDeletes += 1;
+          throw new Error('storage unavailable');
+        },
+      });
+      try {
+        expect(await errorCode(up.complete(ALICE, id))).toBe('FILE_TYPE_NOT_ALLOWED');
+        expect(failedDeletes).toBe(1);
+      } finally {
+        Object.assign(backend, { deleteObject: realDelete });
+      }
+      expect((await backend.control.stat(key))?.size).toBe(SIZE); // still stored…
+      expect((await up.status(ALICE, id)).manifest.commitStartedAt).toBeTruthy(); // …and still recorded
+
+      await up.discard(ALICE, id);
+      expect(await backend.control.stat(key)).toBeNull();
       expect(await errorCode(up.status(ALICE, id))).toBe('NO_SESSION');
     });
 

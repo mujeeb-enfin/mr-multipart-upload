@@ -35,13 +35,36 @@ export interface StoreContext {
   readonly namespaceKey: string;
 }
 
-/** The provider's parts that are exactly the size their index requires. */
-export async function listVerifiedCloudParts(ctx: StoreContext, manifest: UploadManifest): Promise<CloudPart[]> {
+/** The provider's parts that are exactly the size their index requires — what a commit can use. */
+export async function listCommittableCloudParts(ctx: StoreContext, manifest: UploadManifest): Promise<CloudPart[]> {
   if (manifest.committed || !manifest.cloud || !ctx.backend) return [];
   const parts = await ctx.backend.listParts(manifest.cloud);
   return parts.filter(
     (p) => p.index >= 1 && p.index <= manifest.partCount && p.size === expectedPartBytes(p.index, manifest.partBytes, manifest.totalBytes),
   );
+}
+
+/**
+ * The parts as the CLIENT sees them. Once the provider has committed the file —
+ * recorded (`committed`: onComplete failed), or not yet (a server stopped
+ * mid-complete) — it has consumed the parts, and none can be sent again: S3
+ * refuses parts for a completed upload. Every part then counts as received, so
+ * a reload sends the browser straight to `complete`, which finishes the file.
+ */
+export async function listVerifiedCloudParts(ctx: StoreContext, manifest: UploadManifest): Promise<CloudPart[]> {
+  const everyPart = () =>
+    Array.from({ length: manifest.partCount }, (_, i) => ({
+      index: i + 1,
+      size: expectedPartBytes(i + 1, manifest.partBytes, manifest.totalBytes),
+      sha256: undefined,
+    }));
+  if (manifest.committed) return everyPart();
+  const parts = await listCommittableCloudParts(ctx, manifest);
+  if (parts.length === 0 && manifest.commitStartedAt && manifest.cloud && ctx.backend) {
+    const stored = await ctx.backend.control.stat(manifest.cloud.key).catch(() => null);
+    if (stored && !stored.isDirectory) return everyPart();
+  }
+  return parts;
 }
 
 export async function readManifest(ctx: StoreContext, uploadId: string): Promise<UploadManifest | null> {

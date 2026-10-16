@@ -270,6 +270,9 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
       const attempt = (attemptsByPart.get(index) ?? 0) + 1;
       attemptsByPart.set(index, attempt);
       if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
+      // Direct transfer: whether this attempt reached the STORAGE — a failure
+      // before that came from the app's own server (the signing request).
+      let reachedStorage = false;
       const response = await (async () => {
         if (!direct) {
           return sendPart({
@@ -290,6 +293,7 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
           { fingerprint, sha256: checksum, ...(md5 ? { md5 } : {}) },
         );
         if (!signed) throw new UploadClientError('The server did not sign the part.', 0);
+        reachedStorage = true;
         return sendPart({ url: signed.url, body, credentials: 'omit', signal: controller.signal, headers: signed.headers, onProgress: onPartProgress });
       })().catch((err: unknown) => {
         if (err instanceof UploadClientError) return err;
@@ -318,13 +322,15 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
       // the upload as an error the user did not cause.
       if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
       if (failure.code === 'PAUSED') throw failure;
-      // Direct transfer: the storage answers 403 for an expired or skewed
+      // Direct transfer: the STORAGE answers 403 for an expired or skewed
       // signature and 400 for bytes that failed its checksum — both cured by a
-      // fresh URL and a resend, within the attempt limit.
-      const retryableDirect = direct && !failure.code && (failure.status === 400 || failure.status === 403);
+      // fresh URL and a resend, within the attempt limit. The same statuses from
+      // the app's own server (the signing request) are final, as everywhere else.
+      const retryableDirect = reachedStorage && !failure.code && (failure.status === 400 || failure.status === 403);
       if ((!retryableDirect && !isRetryable(failure.status, failure.code)) || attempt === maxAttempts) throw failure;
 
-      if (failure.status === 429) {
+      // S3 throttles with 503 SlowDown and Azure with 503 ServerBusy, not 429.
+      if (failure.status === 429 || (reachedStorage && failure.status === 503)) {
         // Self-limit for the rest of the run rather than oscillate: an upload that
         // finishes slowly beats one that keeps tripping the limiter.
         concurrency = 1;

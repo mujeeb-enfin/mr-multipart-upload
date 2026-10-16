@@ -59,8 +59,12 @@ export interface CloudBackend {
   /** True when this configuration can issue direct-transfer URLs. */
   readonly supportsDirect: boolean;
 
-  /** Start the provider's multipart session for the final object `key`. */
-  createSession(key: string, contentType: string): Promise<CloudSessionRef>;
+  /**
+   * Start the provider's multipart session for the final object `key`. With
+   * `stagingKey` (Azure direct transfer) parts go to that blob instead, and
+   * `commit` copies it to `key` — the browser's URLs never name the final key.
+   */
+  createSession(key: string, contentType: string, stagingKey?: string): Promise<CloudSessionRef>;
   /** Discard an unfinished session and everything uploaded into it. Absent is success. */
   abortSession(session: CloudSessionRef): Promise<void>;
   /** Store one part sent through the server. `sha256` is verified lowercase hex. */

@@ -123,7 +123,7 @@ class S3ControlStore implements StorageAdapter {
     }
   }
 
-  async createExclusive(key: string, data: Uint8Array | string): Promise<'created' | 'exists'> {
+  async createExclusive(key: string, data: Uint8Array | string, conflictRetried = false): Promise<'created' | 'exists'> {
     try {
       // Conditional write: S3 refuses with 412 if the key exists, atomically.
       await this.client.send(
@@ -131,8 +131,11 @@ class S3ControlStore implements StorageAdapter {
       );
       return 'created';
     } catch (err) {
-      // 409 ConditionalRequestConflict: a concurrent conditional write is in progress.
-      if (statusOf(err) === 412 || statusOf(err) === 409) return 'exists';
+      if (statusOf(err) === 412) return 'exists';
+      // 409 ConditionalRequestConflict: a concurrent write or DELETE of the key
+      // was in flight, so the key may well NOT exist (a lock being released).
+      // Asked once more; a second conflict means another writer is active now.
+      if (statusOf(err) === 409) return conflictRetried ? 'exists' : this.createExclusive(key, data, true);
       throw err;
     }
   }
@@ -202,7 +205,9 @@ export async function createS3Backend(config: S3BackendConfig): Promise<CloudBac
     region: config.region,
     ...(config.endpoint ? { endpoint: config.endpoint } : {}),
     forcePathStyle: config.forcePathStyle,
-    ...(config.credentials ? { credentials: config.credentials } : {}),
+    // A copy: the SDK writes into the credentials object it is given, and the
+    // configuration it came from is a cache key (see cloud-backends.ts).
+    ...(config.credentials ? { credentials: { ...config.credentials } } : {}),
     requestChecksumCalculation: 'WHEN_REQUIRED',
     responseChecksumValidation: 'WHEN_REQUIRED',
   });
