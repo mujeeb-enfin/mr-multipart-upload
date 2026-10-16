@@ -17,7 +17,10 @@
     "react-dom": "19.3.0"
   },
   "devDependencies": {
+    "@aws-sdk/client-s3": "3.1152.0",
+    "@aws-sdk/s3-request-presigner": "3.1152.0",
     "@axe-core/playwright": "4.13.0",
+    "@azure/storage-blob": "12.34.0",
     "@playwright/test": "1.64.0",
     "@types/node": "26.6.5",
     "@types/react": "19.3.0",

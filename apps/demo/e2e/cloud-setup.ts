@@ -12,7 +12,8 @@
 // Before the run this creates the bucket / container if needed and gives it
 // the CORS rule direct transfer needs: the browser PUTs parts from the app's
 // origin straight to the storage. The rule is what the package README tells
-// operators to configure.
+// operators to configure. It is ADDED to the existing rules, never replacing
+// them: pointed at a real account or bucket, this must not wipe its CORS.
 // ---------------------------------------------------------------------------
 
 export async function prepareCloudStorage(appOrigin: string): Promise<void> {
@@ -26,13 +27,20 @@ export async function prepareCloudStorage(appOrigin: string): Promise<void> {
     if (!connection || !container) throw new Error('azure_blob e2e needs MULTIPART_UPLOAD_AZURE_CONNECTION_STRING and _CONTAINER');
     const service = BlobServiceClient.fromConnectionString(connection);
     await service.getContainerClient(container).createIfNotExists();
-    await service.setProperties({
-      cors: [{ allowedOrigins: appOrigin, allowedMethods: 'PUT', allowedHeaders: '*', exposedHeaders: '*', maxAgeInSeconds: 600 }],
-    });
+    // CORS is a property of the whole Blob service, shared by every container.
+    const existing = (await service.getProperties()).cors ?? [];
+    // Azure keeps origins and methods as comma-separated lists, and allows at
+    // most five rules, so a rule already covering this origin is reused.
+    const listed = (value: string, item: string) => value.split(',').map((v) => v.trim()).some((v) => v === item || v === '*');
+    if (!existing.some((rule) => listed(rule.allowedOrigins, appOrigin) && listed(rule.allowedMethods, 'PUT'))) {
+      await service.setProperties({
+        cors: [...existing, { allowedOrigins: appOrigin, allowedMethods: 'PUT', allowedHeaders: '*', exposedHeaders: '*', maxAgeInSeconds: 600 }],
+      });
+    }
     return;
   }
 
-  const { S3Client, CreateBucketCommand, PutBucketCorsCommand } = await import('@aws-sdk/client-s3');
+  const { S3Client, CreateBucketCommand, GetBucketCorsCommand, PutBucketCorsCommand } = await import('@aws-sdk/client-s3');
   const minio = storage === 'minio';
   const endpoint = minio ? process.env.MULTIPART_UPLOAD_MINIO_ENDPOINT : process.env.MULTIPART_UPLOAD_S3_ENDPOINT;
   const Bucket = minio ? process.env.MULTIPART_UPLOAD_MINIO_BUCKET : process.env.MULTIPART_UPLOAD_S3_BUCKET;
@@ -49,11 +57,19 @@ export async function prepareCloudStorage(appOrigin: string): Promise<void> {
   await client.send(new CreateBucketCommand({ Bucket })).catch((err: { name?: string }) => {
     if (err.name !== 'BucketAlreadyOwnedByYou' && err.name !== 'BucketAlreadyExists') throw err;
   });
+  const existing = await client
+    .send(new GetBucketCorsCommand({ Bucket }))
+    .then((out) => out.CORSRules ?? [])
+    .catch((err: { name?: string }) => {
+      if (err.name === 'NoSuchCORSConfiguration') return [];
+      throw err;
+    });
+  if (existing.some((rule) => rule.AllowedOrigins?.includes(appOrigin) && rule.AllowedMethods?.includes('PUT'))) return;
   await client.send(
     new PutBucketCorsCommand({
       Bucket,
       CORSConfiguration: {
-        CORSRules: [{ AllowedOrigins: [appOrigin], AllowedMethods: ['PUT'], AllowedHeaders: ['*'], ExposeHeaders: ['ETag'], MaxAgeSeconds: 600 }],
+        CORSRules: [...existing, { AllowedOrigins: [appOrigin], AllowedMethods: ['PUT'], AllowedHeaders: ['*'], MaxAgeSeconds: 600 }],
       },
     }),
   );
