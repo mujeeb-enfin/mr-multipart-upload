@@ -246,7 +246,7 @@ createUploadRoutes({
 | Storage configuration needed | none | a **CORS rule** on the bucket / container (below) |
 | `local` storage | yes | no |
 
-`direct` is refused at startup for `local` storage. URLs live for `directUrlTtlSeconds` (default 900; `MULTIPART_UPLOAD_DIRECT_URL_TTL_SECONDS`), are scoped to one part of one upload, and are issued only to the authorised owner of the upload. The client fetches a fresh URL for every attempt, so an expired one never strands a retry.
+`direct` is refused at startup for `local` storage. URLs live for `directUrlTtlSeconds` (default 900; `MULTIPART_UPLOAD_DIRECT_URL_TTL_SECONDS`), are issued only to the authorised owner of the upload, and never name the stored file — see [How direct URLs are scoped](#cors-for-direct-transfer). The client fetches a fresh URL for every attempt, so an expired one never strands a retry.
 
 ### aws_s3
 
@@ -286,7 +286,7 @@ createUploadRoutes({
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads"],
+      "Action": ["s3:ListBucket"],
       "Resource": "arn:aws:s3:::my-uploads"
     }
   ]
@@ -328,12 +328,14 @@ MinIO has its own users and keys, not AWS IAM, so the keys are required. Path-st
 
 | You set | Used for | Direct transfer |
 |---|---|---|
-| a connection string | the account key in it | yes (service SAS) |
+| a connection string | the account key in it (or the SAS in it) | yes with an account key (service SAS); **no** if it holds only a SAS |
 | account URL + account key | shared key | yes (service SAS) |
 | account URL + SAS token | the SAS token | **no** — a SAS cannot sign new ones |
 | account URL only | **Microsoft Entra ID** via `DefaultAzureCredential`: managed identity, workload identity, a service principal (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_SECRET`), or a developer login | yes (user delegation SAS) |
 
-With Entra ID, assign the identity **Storage Blob Data Contributor** on the container; direct transfer also needs **Storage Blob Delegator** (to request user delegation keys). Microsoft recommends Entra ID over account keys.
+With Entra ID, assign the identity **Storage Blob Data Contributor**. For direct transfer it must hold that role (or **Storage Blob Delegator**) at **storage-account scope or above**: the user delegation key that signs the URLs can only be requested there, so a role scoped to the container alone is not enough. Microsoft recommends Entra ID over account keys.
+
+A service SAS (the account-key path) needs **Shared Key access** enabled on the account. With **soft delete or blob versioning** enabled, deleted staging blobs, locks and control files are retained — and billed — for the retention period, and every manifest write creates a version; consider excluding the upload prefix, or a short retention.
 
 ### CORS for direct transfer
 
@@ -342,10 +344,14 @@ The browser sends parts from your app's origin straight to the storage, so the s
 **S3 / MinIO** — bucket CORS configuration:
 
 ```json
-[{ "AllowedOrigins": ["https://app.example.com"], "AllowedMethods": ["PUT"], "AllowedHeaders": ["*"], "ExposeHeaders": ["ETag"], "MaxAgeSeconds": 3600 }]
+[{ "AllowedOrigins": ["https://app.example.com"], "AllowedMethods": ["PUT"], "AllowedHeaders": ["*"], "MaxAgeSeconds": 3600 }]
 ```
 
 **Azure** — Storage account → Resource sharing (CORS) → Blob service: allowed origin `https://app.example.com`, method `PUT`, allowed headers `*`, exposed headers `*`.
+
+Add the rule alongside any you already have; it does not need to replace them.
+
+**How direct URLs are scoped.** An S3 part URL is signed for one part of one multipart upload, with its SHA-256 and exact length; once the upload is committed it is useless. An Azure SAS cannot be limited to one operation — a write SAS on a blob also allows replacing the whole blob — so Azure part URLs never name the final file. They name a staging blob of that upload session; at `complete` the server copies it to the final key with its own credentials and checks the copy. A URL kept after the upload can at most write to the staging blob, never to the stored file.
 
 ### What differs by backend
 
@@ -356,16 +362,21 @@ The browser sends parts from your app's origin straight to the storage, so the s
 | `checksum` of the stored file | `sha256`: the exact SHA-256 | `sha256-composite`: SHA-256 of every part's SHA-256 (S3's own definition) | `sha256-composite` with proxy transfer; **null** with direct transfer, where Azure verifies only MD5 |
 | `sha256` field | the exact SHA-256 | empty — S3 does not compute a plain SHA-256 of a multipart object | empty |
 | Deduplication | yes | no — the object key is fixed before any byte exists | no |
-| Default stored key | `files/<user hash>/<sha256>.<ext>` | `<prefix>files/<user hash>/<upload id>.<ext>` | the same |
+| Default stored key | `files/<user hash>/<sha256>.<ext>` | `<prefix>files/<user hash>/<upload id>-<session id>.<ext>` — fixed when the upload begins, kept through pause, reload and resume; a new upload of the same file gets a new one | the same |
+| Commit onto an existing object | — | refused with `DESTINATION_EXISTS`, nothing overwritten, the parts kept | the same |
+| Direct transfer | — | parts go to the S3 multipart upload | parts go to a staging blob, copied to the final key at `complete` (one server-side copy) |
 | `onComplete` fails | the file is removed, the parts are kept for a retry | the committed object is kept; a retried `complete` re-runs only `onComplete` | the same |
-| Server stops mid-`complete` | parts are kept; the retry assembles again | the retry finishes the committed file (`checksum: null`); discard or the sweep deletes it | the same |
-| Unfinished uploads | the sweep | the sweep aborts the S3 session; add the lifecycle rule above | the sweep deletes a blob holding only uncommitted blocks — never a stored file at the same key; Azure also discards uncommitted blocks after about 7 days |
+| Server stops mid-`complete` | parts are kept; the retry assembles again | the retry finishes the committed file (`checksum: null`) — after a reload too, which resumes with nothing left to send; discard or the sweep deletes it | the same |
+| Unfinished uploads | the sweep | the sweep aborts the S3 session; add the lifecycle rule above | proxy: the sweep deletes a blob holding only uncommitted blocks — never a stored file at the same key; direct: it deletes the session's staging blob, committed or not. Azure also discards uncommitted blocks after about 7 days |
 
-Configuration problems are refused at startup, with the setting named: a part size under 5 MiB for S3, a maximum size needing more parts than the provider allows, `direct` with local storage or with an Azure SAS token. No error ever contains a secret.
+Configuration problems are refused at startup, with the setting named: a part size under 5 MiB for S3, a maximum size needing more parts than the provider allows, `direct` with local storage or with an Azure SAS token (alone or in a connection string). No error ever contains a secret.
+
+**A custom `destination()` on cloud storage must return a different key for every upload** — use `sessionId`, which is new for each upload session and kept while it resumes. The key is chosen before any byte exists, so `sha256` is empty there; a 0.2.x-style `` `uploads/${sha256}.${extension}` `` would give every upload the same key. A commit onto an object the upload did not create is refused with `DESTINATION_EXISTS` rather than overwriting it. That check runs once, before the upload's first commit attempt; a retry of an attempt that failed part-way trusts the key, so a key shared between uploads is still a mistake, not a supported mode.
 
 **Limitations to know.**
 
-- With `direct` transfer to **Azure**, a SAS cannot restrict the size of a block. A wrong-sized block is never committed — the server checks every part's size — but Azure stores it until its uncommitted-block cleanup (about 7 days). S3 has no such gap: the length is signed into the URL.
+- With `direct` transfer to **Azure**, a SAS cannot restrict the size of a block, nor the operation: it also allows replacing the whole staging blob. Neither reaches the stored file — wrong-sized blocks are never committed, the copy is conditional on the exact staging blob that was committed, and the size and content checks read the copy — but a URL stays valid for its lifetime (`directUrlTtlSeconds`), so after an upload ends it can still write a staging blob in that session's folder, billed until Azure's uncommitted-block cleanup (about 7 days) or, if committed, until a sweep or a lifecycle rule on the upload prefix removes it. Keep `directUrlTtlSeconds` short. S3 has no such gap: a part URL is bound to its multipart upload, and useless once that is complete.
+- Azure direct `complete` waits for a server-side copy (normally instant within one account). It gives up after 10 minutes and aborts the copy; a retry starts over.
 - The composite checksum is not the SHA-256 of the file and cannot be compared with one. It is reproducible from the file and the part size: SHA-256 over the concatenated SHA-256 of each part.
 - The cloud backends were tested against S3- and Azure-compatible emulators (VersityGW, which enforces SigV4 signatures and checksums, and Azurite) — not yet against AWS, a MinIO server or Azure themselves. IAM-role, Entra ID and user-delegation paths use the official SDKs' own credential handling and have not been exercised in this project's tests.
 
@@ -495,7 +506,7 @@ Returns `{ GET, POST, PUT, DELETE, uploader }`. Export the four handlers from yo
 | `allowAnonymous` | Accept uploads with no `authorize`. All anonymous callers share one namespace. Use only deliberately. |
 | `onComplete(input)` | Called once the file is stored. Receives `{ file, metadata, namespace, uploadId, deduplicated }`. Its return value is sent to the client as `result`. If it throws, a newly stored file is removed and the parts are kept, so the user can retry. |
 | `validateHead(bytes, info)` | Inspect the first bytes of the file (64 KB by default) before it is assembled. Throw to refuse with 422. The parts are kept. Runs after the `allowedTypes` content check. |
-| `destination(info)` | Choose the storage key of a completed file. Default: `files/<namespace hash>/<sha256>.<ext>`. |
+| `destination(info)` | Choose the storage key of a completed file. `info` holds `sha256`, `extension`, `namespaceKey` and `fileName`; for cloud storage also `uploadId` and `sessionId`. Default: `files/<namespace hash>/<sha256>.<ext>` (local); `files/<namespace hash>/<uploadId>-<sessionId>.<ext>` (cloud, where `sha256` is empty — see [Storage backends](#what-differs-by-backend)). |
 | `basePath` | URL the route is mounted at. Default `/api/uploads`. |
 | `maxMetadataBytes` | Largest metadata object accepted. Default 16 KB. |
 | `headBytes` | Bytes passed to `validateHead`. Default 64 KB. |
@@ -701,6 +712,8 @@ Every error response is `{ "error": { "code", "message", "details"? } }`.
 | `UNAUTHORIZED` | 401 | `authorize` refused. |
 | `NOT_FOUND` | 404 | Unknown path — check `basePath`. |
 | `CONFIG_INVALID` | 500 | A bad `.env` value or option. The message names it. |
+| `DESTINATION_EXISTS` | 409 | Cloud storage: an object this upload did not create already exists at its key — usually a custom `destination()` that is not unique per upload. Nothing overwritten; the parts are kept. |
+| `INSECURE_CONTEXT` | — | Client only, direct transfer: the page is not a secure context (HTTPS or `localhost`), so the browser cannot compute the SHA-256 each part is signed with. |
 
 ---
 

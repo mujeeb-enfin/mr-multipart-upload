@@ -88,7 +88,7 @@ Browser → route → backend. All checks as today: auth on every part, our SHA-
 3. The browser PUTs the part to S3 / Azure.
 4. `complete` (server): list parts, verify every size, commit, **then** content check on the first bytes (ranged read); a refused file is deleted.
 
-Trade-offs, documented: the content check runs after commit (refused files exist briefly); the bucket/container needs **CORS** (S3: allow PUT, expose `ETag`; Azure: allow PUT and `x-ms-*` / `Content-MD5` headers).
+Trade-offs, documented: the content check runs after commit (refused files exist briefly); the bucket/container needs **CORS** (S3: allow PUT; Azure: allow PUT and `x-ms-*` / `Content-MD5` headers).
 
 ---
 
@@ -96,14 +96,15 @@ Trade-offs, documented: the content check runs after commit (refused files exist
 
 ### aws_s3
 - **Manifest** at `<prefix>.parts/<ns>/<uploadId>/manifest.json`, created with `If-None-Match: *` (exclusive). Stores S3's **UploadId** — the one random value, persisted where our derived id points.
-- **Final key** chosen at `CreateMultipartUpload`: `<prefix>files/<ns>/<uploadId>.<ext>`.
+- **Final key** chosen at `CreateMultipartUpload`: `<prefix>files/<ns>/<uploadId>-<sessionId>.<ext>` — `sessionId` is random per new session and kept in the manifest, so resume keeps the key and a re-upload of the same file never shares it. A commit onto an object the upload did not create is refused (`DESTINATION_EXISTS`).
 - Parts with `ChecksumAlgorithm: SHA256`: S3 verifies every part. Direct mode signs `x-amz-checksum-sha256` **and** `Content-Length` into the URL, so S3 enforces both.
 - `complete`: paginated `ListParts` → `CompleteMultipartUpload` (ETag + checksum per part, consecutive from 1).
 - Discard: `AbortMultipartUpload` + delete manifest. Sweep: `ListMultipartUploads` under the prefix + manifest age; docs give the lifecycle rule.
-- IAM permissions documented: `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:ListBucket`, `s3:AbortMultipartUpload`, `s3:ListMultipartUploadParts`, `s3:ListBucketMultipartUploads`.
+- IAM permissions documented: `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject`, `s3:ListBucket`, `s3:AbortMultipartUpload`, `s3:ListMultipartUploadParts`.
 
 ### azure_blob
-- **Blob** `files/<ns>/<uploadId>.<ext>`; manifest blob created with `If-None-Match: *`.
+- **Blob** `files/<ns>/<uploadId>-<sessionId>.<ext>`; manifest blob created with `If-None-Match: *`.
+- **Direct transfer stages, then copies.** An Azure write SAS also allows Put Blob, so part URLs name a per-session staging blob, never the final key. `complete` commits the staging blob, copies it to the final key with the server's credentials (conditional on the committed ETag; 10-minute deadline), resets the content type, then checks the copy.
 - **Block ID = Base64(4-byte part index + 32-byte part SHA-256)** — fixed 36 bytes, derived, no stored upload id; the part hashes are recoverable from `Get Block List`.
 - Proxy: server verifies our SHA-256, then stages with `Content-MD5`. Direct: user-delegation / service SAS (write, one blob, short expiry); the client sends `Content-MD5` (a small built-in MD5, no dependency — Web Crypto has no MD5).
 - `complete`: `Get Block List` (uncommitted) → verify sizes → `commitBlockList` (content type set) → content check.
