@@ -80,6 +80,19 @@ export interface CloudSessionRef {
   readonly uploadId?: string;
   /** Azure direct transfer: the blob the browser writes to, copied to `key` at commit. */
   readonly stagingKey?: string;
+  /**
+   * Azure: 16 hex characters carried in every block id of this session, so it
+   * never lists another session's blocks on a shared blob (see azureBlockId).
+   * Absent for sessions started before tags existed.
+   */
+  readonly blockTag?: string;
+  /**
+   * S3 / MinIO: 16 hex characters stamped as object metadata when the multipart
+   * upload is created. S3 copies that metadata onto the object a completion
+   * creates, so the object itself proves which session committed it (see
+   * holdsOwnCommit). Absent for sessions started before tags existed.
+   */
+  readonly objectTag?: string;
 }
 
 export interface FileChecksum {

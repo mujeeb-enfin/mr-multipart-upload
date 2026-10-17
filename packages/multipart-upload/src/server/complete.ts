@@ -24,17 +24,19 @@
 // `destination`, knowingly.
 // ---------------------------------------------------------------------------
 
-import { UploadError } from '../core/errors.js';
-import { FILES_DIR, PARTS_DIR, lockKey, parsePartFileName, partKey, sessionKey, stagingKey } from '../core/layout.js';
+import { UploadError, destinationExists } from '../core/errors.js';
+import { FILES_DIR, PARTS_DIR, parsePartFileName, partKey, sessionKey, stagingKeyForGeneration } from '../core/layout.js';
 import { expectedPartBytes } from '../core/arithmetic.js';
 import { SIGNATURE_BYTES } from '../core/file-signatures.js';
 import type { FileChecksum, UploadMetadata } from '../core/session.js';
 import { assertContentAllowed, declaredTypeFor } from './file-types.js';
+import { acquireLock, DEFAULT_LOCK_STALE_MS, type HeldLock } from './lock.js';
 import { partTagFor } from './namespace.js';
 import { readManifest, readSession, type StoreContext } from './store.js';
 import type { UploaderOptions } from './uploader.js';
 
-export const DEFAULT_LOCK_STALE_MS = 15 * 60 * 1000;
+// Defined in lock.ts; re-exported so existing imports keep working.
+export { acquireLock, DEFAULT_LOCK_STALE_MS, discardUnderLock } from './lock.js';
 const DEFAULT_HEAD_BYTES = 64 * 1024;
 
 export interface CompletedFile {
@@ -99,52 +101,6 @@ export function extensionOf(fileName: string): string {
 }
 
 /**
- * Discard under the `complete` lock. Deleting the parts while `complete` is
- * using them would turn a successful finish into a half-assembled failure, so
- * discard TAKES the lock rather than only looking for it: a complete starting
- * between a look and the delete would otherwise race it. A lock older than
- * `staleMs` belonged to a process that died, and is taken over. `remove`
- * deletes the session (and, for cloud storage, the provider's side).
- */
-export async function discardUnderLock(store: StoreContext, uploadId: string, staleMs: number, remove: () => Promise<void>): Promise<void> {
-  try {
-    await acquireLock(store, uploadId, staleMs);
-  } catch (err) {
-    if (err instanceof UploadError && err.code === 'COMPLETE_IN_PROGRESS') {
-      throw new UploadError('COMPLETE_IN_PROGRESS', 'This upload is being finalised and cannot be discarded now.');
-    }
-    throw err;
-  }
-  try {
-    await remove();
-  } catch (err) {
-    // The session survives a failed discard; its lock must not block it.
-    await store.storage.remove(lockKey(store.namespaceKey, uploadId)).catch(() => undefined);
-    throw err;
-  }
-}
-
-/** The single-flight lock `complete` holds — and `discard` takes, so the two never overlap. */
-export async function acquireLock(store: StoreContext, uploadId: string, staleMs: number): Promise<void> {
-  const key = lockKey(store.namespaceKey, uploadId);
-  const stamp = new Date().toISOString();
-  if ((await store.storage.createExclusive(key, stamp)) === 'created') return;
-
-  // A lock is a file, so a process that dies mid-complete leaves it behind and
-  // the upload could never be finished. One older than `staleMs` is taken over;
-  // assembling even a multi-gigabyte file takes seconds, not minutes.
-  const info = await store.storage.stat(key);
-  // No lock after all: it was released between the two calls (S3 also reports
-  // a write that raced a delete as a conflict). Asked once more.
-  if (!info && (await store.storage.createExclusive(key, stamp)) === 'created') return;
-  if (info && Date.now() - info.modifiedMs > staleMs) {
-    await store.storage.remove(key);
-    if ((await store.storage.createExclusive(key, stamp)) === 'created') return;
-  }
-  throw new UploadError('COMPLETE_IN_PROGRESS', 'This upload is already being finalised.');
-}
-
-/**
  * Delete parts that do not belong in this assembly: orphans of another file
  * (a different part tag), indices beyond the part count, and wrong sizes. Only
  * ever under the lock, when no write for this upload should be in flight.
@@ -190,6 +146,45 @@ function destinationFor(
   return key;
 }
 
+/** Whether the lock is still this request's — for cleanup that must not touch a taker's work. */
+export async function stillHeld(lock: HeldLock): Promise<boolean> {
+  return lock.confirm().then(
+    () => true,
+    () => false,
+  );
+}
+
+/**
+ * Publish the assembled file at `key` unless something is already there, and
+ * report whether it was (`deduplicated`: the content-addressed key already held
+ * these bytes). With `promoteExclusive` the check and the publish are one
+ * atomic step, so two completes onto one key cannot both publish — one would
+ * otherwise silently replace the other. A custom adapter without it gets a
+ * check, then a move.
+ */
+/**
+ * Assembly files of OLDER lock generations — left by holders that crashed or
+ * were taken over. Each is a full copy of the file; without this they would
+ * accumulate, one per takeover, until the session ends.
+ */
+async function removeStaleStagingFiles(store: StoreContext, uploadId: string, generation: number): Promise<void> {
+  const dir = sessionKey(store.namespaceKey, uploadId);
+  for (const entry of await store.storage.list(dir).catch(() => [] as string[])) {
+    const match = /^assembled\.([0-9]{1,15})\.bin$/.exec(entry);
+    if (match && Number(match[1]) < generation) await store.storage.remove(`${dir}/${entry}`).catch(() => undefined);
+  }
+}
+
+async function promoteUnlessPresent(store: StoreContext, staging: string, key: string): Promise<boolean> {
+  const outcome = store.storage.promoteExclusive
+    ? await store.storage.promoteExclusive(staging, key)
+    : (await store.storage.stat(key))
+      ? 'exists'
+      : (await store.storage.promote(staging, key), 'moved');
+  if (outcome === 'exists') await store.storage.remove(staging);
+  return outcome === 'exists';
+}
+
 export async function completeUpload(
   store: StoreContext,
   uploadId: string,
@@ -201,13 +196,14 @@ export async function completeUpload(
   if (!(await readManifest(store, uploadId))) {
     throw new UploadError('NO_SESSION', `No upload in progress for "${uploadId}"`);
   }
-  await acquireLock(store, uploadId, options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS);
+  const lock = await acquireLock(store, uploadId, options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS);
 
-  const staging = stagingKey(store.namespaceKey, uploadId);
+  const staging = stagingKeyForGeneration(store.namespaceKey, uploadId, lock.generation);
   let stagingExists = false;
 
   try {
     await pruneParts(store, uploadId);
+    await removeStaleStagingFiles(store, uploadId, lock.generation);
 
     const session = await readSession(store, uploadId);
     const { manifest } = session;
@@ -260,16 +256,21 @@ export async function completeUpload(
       );
     }
 
-    const key = destinationFor(store, options, assembly.sha256, manifest.fileName);
-    const deduplicated = (await store.storage.stat(key)) !== null;
-    if (deduplicated) {
-      // The content-addressed key already holds these exact bytes. `rename` would
-      // silently replace it, so the duplicate is dropped explicitly instead.
-      await store.storage.remove(staging);
-    } else {
-      await store.storage.promote(staging, key);
+    // Assembly is the long step: make sure the lock is still ours (a request
+    // that took it over would publish too) and refresh it, before publishing —
+    // and that the upload still exists: a lock rewrite that landed after a
+    // taker finished and removed the session must not revive it.
+    await lock.refresh();
+    if (!(await readManifest(store, uploadId))) {
+      throw new UploadError('COMPLETE_IN_PROGRESS', 'Another request finished this upload.');
     }
+    const key = destinationFor(store, options, assembly.sha256, manifest.fileName);
+    const deduplicated = await promoteUnlessPresent(store, staging, key);
     stagingExists = false;
+    // An existing file is "the same bytes" only at the default, content-addressed
+    // key. At a custom destination it is another upload's file: refused, as on
+    // cloud storage, instead of handing this upload someone else's bytes.
+    if (deduplicated && options.destination) throw destinationExists();
 
     const checksum: FileChecksum = { type: 'sha256', value: assembly.sha256 };
     const file: CompletedFile = {
@@ -285,18 +286,28 @@ export async function completeUpload(
 
     let result: unknown = null;
     if (options.onComplete) {
+      await lock.refresh();
       try {
         result = (await options.onComplete({ file, metadata: manifest.metadata, namespace, uploadId, deduplicated })) ?? null;
       } catch (err) {
-        // A file nothing has recorded is invisible and would never be deleted.
-        // Remove it — unless it pre-existed, in which case it belongs to an
-        // earlier upload and must stay. The parts are kept for a retry.
-        if (!deduplicated) await store.storage.remove(key).catch(() => undefined);
+        // A file nothing has recorded would never be deleted, so at a custom
+        // destination (one upload, one key) it is removed, while the lock is
+        // still ours. At the default content-addressed key it STAYS: another
+        // upload of the same bytes in this namespace may already have found it
+        // (deduplicated) and recorded it — deleting it would lose that record's
+        // file. A retry finds it again. The parts are kept either way.
+        if (!deduplicated && options.destination && (await stillHeld(lock))) {
+          await store.storage.remove(key).catch(() => undefined);
+        }
         throw err;
       }
     }
 
-    await store.storage.removeTree(sessionKey(store.namespaceKey, uploadId));
+    // The parts go only while the lock is still ours: a request that took over
+    // during a long onComplete may be assembling them right now. The file is
+    // stored and recorded, so a cleanup failure is not the caller's: the sweep
+    // reclaims what is left.
+    if (await stillHeld(lock)) await store.storage.removeTree(sessionKey(store.namespaceKey, uploadId)).catch(() => undefined);
     return {
       uploadId,
       fileName: manifest.fileName,
@@ -311,6 +322,6 @@ export async function completeUpload(
   } finally {
     if (stagingExists) await store.storage.remove(staging).catch(() => undefined);
     // Absent after a successful complete (the session tree is gone): a no-op.
-    await store.storage.remove(lockKey(store.namespaceKey, uploadId)).catch(() => undefined);
+    await lock.release().catch(() => undefined);
   }
 }

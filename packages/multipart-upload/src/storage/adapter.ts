@@ -71,6 +71,13 @@ export interface StorageAdapter {
   /** Move `fromKey` to `toKey`, creating parents. Replaces an existing `toKey`. */
   promote(fromKey: string, toKey: string): Promise<void>;
 
+  /**
+   * Move `fromKey` to `toKey` only if `toKey` does not exist — one atomic step,
+   * so two concurrent moves onto one key cannot both succeed. 'exists' leaves
+   * `fromKey` in place. Optional: without it a stat, then `promote`, is used.
+   */
+  promoteExclusive?(fromKey: string, toKey: string): Promise<'moved' | 'exists'>;
+
   /** Stream a key's contents. */
   openRead(key: string): ReadableStream<Uint8Array>;
 

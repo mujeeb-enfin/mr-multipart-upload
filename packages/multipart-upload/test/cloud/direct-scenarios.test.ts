@@ -30,6 +30,7 @@ import {
   CLOUD_PART_BYTES,
   azureBlob,
   backendFor,
+  barrier,
   createBucket,
   deleteBucket,
   expectedComposite,
@@ -97,13 +98,15 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — direct transfer', ()
       return put(signed.url, signed.headers as Record<string, string>, body);
     }
 
+    // 60 s: an emulator serving several test files at once can take longer than
+    // the 10 s default to create or delete a bucket / container.
     beforeAll(async () => {
       clearEnv();
       await createBucket(kind, bucket);
-    });
+    }, 60_000);
     afterAll(async () => {
       await deleteBucket(kind, bucket);
-    });
+    }, 60_000);
 
     it('a part URL cannot replace the stored file after its content was checked', async () => {
       // An Azure write SAS covers the WHOLE blob it names: with comp=block and
@@ -162,8 +165,15 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — direct transfer', ()
         const marked = { ...begun.session.manifest, commitStartedAt: new Date().toISOString() };
         await backend.control.write?.(manifestKey(namespaceKeyFor(ALICE.namespace), id), JSON.stringify(marked));
         const staging = await azureBlob(bucket, session.stagingKey as string);
-        await staging.commitBlockList((await backend.listParts(session)).map((p) => azureBlockId(p.index, p.sha256 as string)));
-        if (stopped === 'after-copy') await (await azureBlob(bucket, session.key)).uploadData(await staging.downloadToBuffer());
+        await staging.commitBlockList((await backend.listParts(session)).map((p) => azureBlockId(p.index, p.sha256 as string, session.blockTag)));
+        if (stopped === 'after-copy') {
+          // A real server-side copy, as the stopped complete made it: the final
+          // blob records the staging blob as its copy source, which is how a
+          // retry recognises the copy as its own.
+          const { BlobSASPermissions } = await import('@azure/storage-blob');
+          const source = await staging.generateSasUrl({ permissions: BlobSASPermissions.parse('r'), expiresOn: new Date(Date.now() + 600_000) });
+          await (await (await azureBlob(bucket, session.key)).beginCopyFromURL(source)).pollUntilDone();
+        }
 
         if (then === 'retry') {
           const done = await up.complete(ALICE, id);
@@ -176,6 +186,56 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — direct transfer', ()
         expect(await staging.exists()).toBe(false);
         expect(await errorCode(up.status(ALICE, id))).toBe('NO_SESSION');
       }
+    });
+
+    it('two direct uploads committing onto one shared key at the same moment: exactly one stores', async () => {
+      // Direct transfer's commit is S3's conditional CompleteMultipartUpload, or
+      // Azure's conditional copy from each session's staging blob.
+      // MUTATIONS: drop IfNoneMatch (S3) or the copy's ifNoneMatch condition
+      // (Azure) -> both "succeed", the second replacing the first.
+      const up = uploader({ destination: ({ extension }) => `shared/direct-race.${extension}` });
+      const ALICE_TWO = { namespace: 'user-alice-two' };
+      const first = fileOf(SIZE, 41);
+      const second = fileOf(SIZE, 42);
+      const a = await up.begin(ALICE, { fileName: 'r.bin', totalBytes: SIZE, fingerprint: 'fp-dr-a' });
+      const b = await up.begin(ALICE_TWO, { fileName: 'r.bin', totalBytes: SIZE, fingerprint: 'fp-dr-b' });
+      for (const index of [1, 2, 3]) {
+        expect([200, 201]).toContain(await sendDirect(up, a.session.manifest.uploadId, 'fp-dr-a', first, index));
+        const part = partOf(second, index, CLOUD_PART_BYTES);
+        const signed = await up.presignPart(ALICE_TWO, {
+          uploadId: b.session.manifest.uploadId,
+          index,
+          fingerprint: 'fp-dr-b',
+          sha256: sha256(part),
+          ...(needsMd5 ? { md5: md5b64(part) } : {}),
+        });
+        expect([200, 201]).toContain(await put(signed.url, signed.headers as Record<string, string>, part));
+      }
+      const backend = await backendFor(base());
+      const realCommit = backend.commit;
+      const meet = barrier(2);
+      Object.assign(backend, {
+        commit: async (...args: Parameters<typeof realCommit>) => {
+          await meet.arrive();
+          return realCommit(...args);
+        },
+      });
+      let outcomes: string[];
+      try {
+        outcomes = await Promise.all([
+          errorCode(up.complete(ALICE, a.session.manifest.uploadId)),
+          errorCode(up.complete(ALICE_TWO, b.session.manifest.uploadId)),
+        ]);
+      } finally {
+        Object.assign(backend, { commit: realCommit });
+      }
+      expect([...outcomes].sort()).toEqual(['DESTINATION_EXISTS', 'resolved']);
+      const winner = outcomes[0] === 'resolved' ? first : second;
+      expect(sha256(await readAll(backend.openRead('shared/direct-race.bin')))).toBe(sha256(winner));
+      const [loserCtx, loserId] = outcomes[0] === 'resolved' ? [ALICE_TWO, b.session.manifest.uploadId] : [ALICE, a.session.manifest.uploadId];
+      await up.discard(loserCtx, loserId);
+      expect(sha256(await readAll(backend.openRead('shared/direct-race.bin')))).toBe(sha256(winner));
+      await backend.deleteObject('shared/direct-race.bin');
     });
 
     it('uploads every part straight to the storage and commits it byte-for-byte', async () => {

@@ -45,6 +45,19 @@ describe('Azure block ids', () => {
     expect(ids.map((id) => parseAzureBlockId(id))).toEqual([1, 2, 999, 50_000].map((index) => ({ index, sha256: sha })));
   });
 
+  it('carries a session tag at a fixed length, so sessions sharing a blob tell their blocks apart', () => {
+    // Azure requires every block id of a blob to have the same length: 44 bytes
+    // for every tagged id. The tag must round-trip exactly — listParts keeps a
+    // block only when its tag is the session's own.
+    const tag = '0123456789abcdef';
+    const ids = [1, 2, 50_000].map((i) => azureBlockId(i, sha, tag));
+    expect(new Set(ids.map((id) => id.length))).toEqual(new Set([60])); // 44 bytes → 60 base64 chars
+    expect(ids.map((id) => parseAzureBlockId(id))).toEqual([1, 2, 50_000].map((index) => ({ index, sha256: sha, sessionTag: tag })));
+    expect(azureBlockId(1, sha, tag)).not.toBe(azureBlockId(1, sha, 'fedcba9876543210'));
+    expect(parseAzureBlockId(azureBlockId(1, sha))).not.toHaveProperty('sessionTag'); // untagged (older sessions)
+    expect(() => azureBlockId(1, sha, 'not-a-tag')).toThrow(RangeError);
+  });
+
   it('rejects ids this library did not stage', () => {
     expect(parseAzureBlockId(Buffer.from('foreign-block').toString('base64'))).toBeNull();
     expect(parseAzureBlockId(Buffer.alloc(36).toString('base64'))).toBeNull(); // index 0

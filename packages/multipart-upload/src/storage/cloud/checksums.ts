@@ -37,22 +37,37 @@ export function compositeSha256(partSha256s: readonly (string | undefined)[]): F
   return { type: 'sha256-composite', value: hash.digest('hex'), parts: partSha256s.length };
 }
 
-/** Azure block id for a part: base64(index as uint32 BE ‖ sha256). */
-export function azureBlockId(index: number, sha256: string): string {
+const SESSION_TAG = /^[0-9a-f]{16}$/;
+
+/**
+ * Azure block id for a part: base64(index as uint32 BE ‖ sha256 ‖ session tag).
+ *
+ * The SESSION TAG (8 bytes) exists because Azure keeps uncommitted blocks per
+ * BLOB, not per upload: two sessions whose keys coincide (a custom
+ * destination() that is not unique) stage onto the same blob, and without the
+ * tag each would list — and could commit — the other's blocks, storing a file
+ * spliced from both. With it, each session sees only its own. Ids without a
+ * tag (36 bytes) are those of sessions started before tags existed.
+ */
+export function azureBlockId(index: number, sha256: string, sessionTag?: string): string {
   if (!Number.isInteger(index) || index < 1 || index > 0xffffffff) throw new RangeError(`part index ${index}`);
   if (!HEX_SHA256.test(sha256)) throw new RangeError('sha256 must be 64 lowercase hex characters');
-  const id = Buffer.alloc(36);
+  if (sessionTag !== undefined && !SESSION_TAG.test(sessionTag)) throw new RangeError('sessionTag must be 16 lowercase hex characters');
+  const id = Buffer.alloc(sessionTag === undefined ? 36 : 44);
   id.writeUInt32BE(index, 0);
   Buffer.from(sha256, 'hex').copy(id, 4);
+  if (sessionTag !== undefined) Buffer.from(sessionTag, 'hex').copy(id, 36);
   return id.toString('base64');
 }
 
 /** The part a block id names, or null for a block this library did not stage. */
-export function parseAzureBlockId(blockId: string): { index: number; sha256: string } | null {
+export function parseAzureBlockId(blockId: string): { index: number; sha256: string; sessionTag?: string } | null {
   const raw = Buffer.from(blockId, 'base64');
-  if (raw.length !== 36 || raw.toString('base64') !== blockId) return null;
+  if ((raw.length !== 36 && raw.length !== 44) || raw.toString('base64') !== blockId) return null;
   const index = raw.readUInt32BE(0);
-  return index >= 1 ? { index, sha256: raw.subarray(4).toString('hex') } : null;
+  if (index < 1) return null;
+  const sha256 = raw.subarray(4, 36).toString('hex');
+  return raw.length === 44 ? { index, sha256, sessionTag: raw.subarray(36).toString('hex') } : { index, sha256 };
 }
 
 export function md5Base64(bytes: Uint8Array): string {

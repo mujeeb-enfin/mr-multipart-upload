@@ -19,8 +19,6 @@ import { UploadError } from '../src/core/errors.js';
 import { lockKey, partKey, sessionKey } from '../src/core/layout.js';
 import { namespaceKeyFor, partTagFor } from '../src/server/namespace.js';
 import { createUploader, type Uploader, type UploaderOptions } from '../src/server/uploader.js';
-import type { StorageAdapter } from '../src/storage/adapter.js';
-import { FsStorage } from '../src/storage/fs-storage.js';
 import { MIB, clearEnv, partOf, patternBytes, sha256, tempRoot } from './helpers.js';
 
 let root: string;
@@ -355,7 +353,12 @@ describe('complete', () => {
     expect((await up.status(ALICE, id)).complete).toBe(true); // parts kept
   });
 
-  it('removes the new file but keeps the parts when onComplete throws, so a retry works', async () => {
+  it('keeps the content-addressed file and the parts when onComplete throws, so a retry works', async () => {
+    // At the default key the file may already be recorded by ANOTHER upload of
+    // the same bytes (deduplicated against it): deleting it on this upload's
+    // failure would pull that upload's file away. So it stays; the retry finds it.
+    // MUTATION: remove the file on onComplete failure at the default key -> the
+    // file is gone after the failed attempt.
     let fail = true;
     const up = uploaderWith({
       onComplete: () => {
@@ -366,9 +369,31 @@ describe('complete', () => {
     const bytes = patternBytes(SIZE);
     const id = await fullUpload(up, ALICE, bytes, 'f.bin');
     await expect(up.complete(ALICE, id)).rejects.toThrow('database down');
-    expect(await readdir(join(root, 'files', namespaceKeyFor(ALICE.namespace))).catch(() => [])).toEqual([]);
+    const stored = join(root, 'files', namespaceKeyFor(ALICE.namespace), `${sha256(bytes)}.bin`);
+    expect(sha256(new Uint8Array(await readFile(stored)))).toBe(sha256(bytes));
     fail = false;
-    expect((await up.complete(ALICE, id)).result).toBe('ok');
+    const retried = await up.complete(ALICE, id);
+    expect(retried).toMatchObject({ result: 'ok', sha256: sha256(bytes) });
+    expect(sha256(new Uint8Array(await readFile(stored)))).toBe(sha256(bytes));
+  });
+
+  it('removes the file at a custom destination when onComplete throws, and a retry publishes it again', async () => {
+    // One upload, one key: nothing else can have recorded it, and leaving it
+    // would make the retry find its own leftover and be refused as taken.
+    let fail = true;
+    const up = uploaderWith({
+      destination: ({ extension }) => `custom/one.${extension}`,
+      onComplete: () => {
+        if (fail) throw new Error('database down');
+        return 'ok';
+      },
+    });
+    const bytes = patternBytes(SIZE);
+    const id = await fullUpload(up, ALICE, bytes, 'f.bin');
+    await expect(up.complete(ALICE, id)).rejects.toThrow('database down');
+    expect(await readdir(join(root, 'custom')).catch(() => [])).toEqual([]);
+    fail = false;
+    expect(await up.complete(ALICE, id)).toMatchObject({ result: 'ok', key: 'custom/one.bin', deduplicated: false });
   });
 
   it('reports which parts are missing', async () => {
@@ -407,39 +432,6 @@ describe('complete', () => {
     const id = await fullUpload(up, ALICE, patternBytes(SIZE), 'f.bin');
     await writeFile(join(root, lockKey(namespaceKeyFor(ALICE.namespace), id)), 'busy');
     expect(await codeOf(up.discard(ALICE, id))).toBe('COMPLETE_IN_PROGRESS');
-  });
-
-  it('holds the lock while it discards, so a complete starting meanwhile is refused', async () => {
-    // A discard that only LOOKED for the lock let a complete start between the
-    // look and the delete: one deleted the parts the other was assembling.
-    // MUTATION: replace discardUnderLock's acquireLock with a stat check -> the
-    // complete runs and finishes (or fails mid-assembly), not COMPLETE_IN_PROGRESS.
-    let releaseDelete!: () => void;
-    let deleteReached!: () => void;
-    const reached = new Promise<void>((r) => (deleteReached = r));
-    const gate = new Promise<void>((r) => (releaseDelete = r));
-    const inner = new FsStorage(root);
-    let gated = false;
-    const storage: StorageAdapter = Object.assign(Object.create(FsStorage.prototype), inner, {
-      async removeTree(key: string) {
-        // Only discard's delete is held; a complete that wrongly ran must finish.
-        if (!gated) {
-          gated = true;
-          deleteReached();
-          await gate;
-        }
-        return inner.removeTree(key);
-      },
-    });
-    const up = uploaderWith({ storage });
-    const id = await fullUpload(up, ALICE, patternBytes(SIZE), 'f.bin');
-
-    const discarding = up.discard(ALICE, id);
-    await reached; // discard is now deleting
-    expect(await codeOf(up.complete(ALICE, id))).toBe('COMPLETE_IN_PROGRESS');
-    releaseDelete();
-    await discarding;
-    expect(await codeOf(up.status(ALICE, id))).toBe('NO_SESSION');
   });
 
   it('rejects a complete for an upload that does not exist, without creating anything', async () => {

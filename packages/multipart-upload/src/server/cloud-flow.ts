@@ -24,22 +24,20 @@
 import { randomBytes } from 'node:crypto';
 
 import { expectedPartBytes } from '../core/arithmetic.js';
-import { UploadError } from '../core/errors.js';
+import { UploadError, destinationExists } from '../core/errors.js';
 import { SIGNATURE_BYTES } from '../core/file-signatures.js';
-import { FILES_DIR, PARTS_DIR, activityKey, directStagingKey, headKey, lockKey, manifestKey, sessionKey } from '../core/layout.js';
+import { FILES_DIR, PARTS_DIR, directStagingKey, headKey, manifestKey, sessionKey } from '../core/layout.js';
 import type { CloudSessionRef, CommittedFileRef, UploadManifest } from '../core/session.js';
-import type { CloudBackend, CloudCommitResult, CloudPart } from '../storage/cloud/types.js';
-import { DEFAULT_LOCK_STALE_MS, type CompleteResult, type CompletedFile, acquireLock, extensionOf } from './complete.js';
+import { ProviderSessionLostError, type CloudBackend, type CloudCommitResult, type CloudPart } from '../storage/cloud/types.js';
+import { compositeSha256 } from '../storage/cloud/checksums.js';
+import { backendOf, ownCommittedObject, touch, withoutMarker, writeControl, writeManifest } from './cloud-control.js';
+import { DEFAULT_LOCK_STALE_MS, type CompleteResult, type CompletedFile, acquireLock, extensionOf, stillHeld } from './complete.js';
+import type { HeldLock } from './lock.js';
 import { assertContentAllowed, declaredTypeFor } from './file-types.js';
 import { listCommittableCloudParts, readManifest, type StoreContext } from './store.js';
 import type { UploaderOptions } from './uploader.js';
 
 const DEFAULT_HEAD_BYTES = 64 * 1024;
-
-export function backendOf(store: StoreContext): CloudBackend {
-  if (!store.backend) throw new Error('cloud operation on a store without a cloud backend');
-  return store.backend;
-}
 
 function sessionOf(manifest: UploadManifest) {
   if (!manifest.cloud) throw new UploadError('NO_SESSION', 'This upload was started on another storage backend.');
@@ -93,8 +91,21 @@ export async function openCloudSession(
   return backend.createSession(key, contentType, staged ? directStagingKey(store.namespaceKey, uploadId, sessionId) : undefined);
 }
 
-async function touch(store: StoreContext, uploadId: string): Promise<void> {
-  await store.storage.write?.(activityKey(store.namespaceKey, uploadId), new Date().toISOString());
+/**
+ * The provider dropped the session's multipart upload during the commit (see
+ * ProviderSessionLostError). Its parts are gone and its id is dead, so a new
+ * provider session is opened at the same key and recorded without a commit
+ * marker; picking the file again resumes onto it and sends every part.
+ */
+async function restartSession(store: StoreContext, manifest: UploadManifest, lock: HeldLock, cause: Error): Promise<UploadError> {
+  const old = sessionOf(manifest);
+  if (await stillHeld(lock)) {
+    const fresh = await backendOf(store).createSession(old.key, manifest.contentType ?? 'application/octet-stream', old.stagingKey);
+    await writeManifest(store, { ...withoutMarker(manifest), cloud: fresh });
+  }
+  return new UploadError('INCOMPLETE', `${cause.message} Nothing was stored; send the file again.`, {
+    missingParts: Array.from({ length: Math.min(manifest.partCount, 50) }, (_, i) => i + 1),
+  });
 }
 
 /** Store one part that passed through the server (proxy transfer). */
@@ -118,7 +129,7 @@ export async function storeCloudPart(
     const record = new Uint8Array(32 + Math.min(keep, bytes.byteLength));
     record.set(Buffer.from(sha256, 'hex'), 0);
     record.set(bytes.subarray(0, keep), 32);
-    await store.storage.write?.(headKey(store.namespaceKey, manifest.uploadId), record);
+    await writeControl(store.storage, headKey(store.namespaceKey, manifest.uploadId), record);
   }
   await touch(store, manifest.uploadId);
 }
@@ -149,28 +160,16 @@ export async function presignCloudPart(
 }
 
 /**
- * The object THIS upload's commit left at its key, when the commit's outcome
- * was never recorded: a commit was started (`commitStartedAt`), the provider
- * holds no parts any more, and an object exists. Without the marker an object
- * there is not this upload's — a custom `destination()` gave another upload
- * the same key — and must be neither claimed nor deleted.
- */
-async function ownCommittedObject(backend: CloudBackend, manifest: UploadManifest): Promise<{ key: string; size: number } | null> {
-  if (!manifest.commitStartedAt || !manifest.cloud) return null;
-  if ((await backend.listParts(manifest.cloud)).length > 0) return null;
-  const info = await backend.control.stat(manifest.cloud.key).catch(() => null);
-  return info && !info.isDirectory ? { key: manifest.cloud.key, size: info.size } : null;
-}
-
-/**
  * The file a previous `complete` committed but did not record — it stopped
  * (crash, deploy, timeout) between the provider's commit and the manifest
  * write. Without this, every retry would report INCOMPLETE for a file that is
- * stored. Only at exactly the declared size; its checksum is not recoverable.
+ * stored. Any size: ownership is proved (holdsOwnCommit), and the caller's size
+ * check refuses — and deletes — a wrong-sized one, e.g. a refused file whose
+ * delete failed earlier. Its checksum is not recoverable.
  */
 async function interruptedCommit(backend: CloudBackend, manifest: UploadManifest): Promise<CloudCommitResult | null> {
   const own = await ownCommittedObject(backend, manifest);
-  return own && own.size === manifest.totalBytes ? { ...own, checksum: null } : null;
+  return own ? { ...own, checksum: null } : null;
 }
 
 /**
@@ -191,7 +190,11 @@ function browserWrote(store: StoreContext, manifest: UploadManifest): boolean {
  * retry, discard or the sweep deletes it later — and the refusal says so, so
  * the failure is not hidden behind a 4xx nobody reports.
  */
-async function refused(store: StoreContext, uploadId: string, key: string, refusal: unknown): Promise<unknown> {
+async function refused(store: StoreContext, uploadId: string, key: string, refusal: unknown, lock: HeldLock): Promise<unknown> {
+  // A request that took the lock over (this one stalled in validateHead) owns
+  // the file now and decides about it; deleting it here would pull it from
+  // under that request.
+  if (!(await stillHeld(lock))) return refusal;
   const deleted = await backendOf(store)
     .deleteObject(key)
     .then(() => true)
@@ -238,13 +241,19 @@ export async function completeCloudUpload(
   const backend = backendOf(store);
   const noSession = () => new UploadError('NO_SESSION', `No upload in progress for "${uploadId}"`);
   if (!(await readManifest(store, uploadId))) throw noSession();
-  await acquireLock(store, uploadId, options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS);
+  const lock = await acquireLock(store, uploadId, options.lockStaleMs ?? DEFAULT_LOCK_STALE_MS);
 
   try {
     // Read again under the lock: a discard that held it may have removed it.
     let manifest = await readManifest(store, uploadId);
     if (!manifest) throw noSession();
     let committed = manifest.committed;
+    // A recorded commit whose file is gone (a discard or the sweep deleted it
+    // and stopped before removing the manifest) is not a success to report.
+    if (committed && !(await backend.control.stat(committed.key))) {
+      if (await stillHeld(lock)) await store.storage.remove(manifestKey(store.namespaceKey, uploadId)).catch(() => undefined);
+      throw noSession();
+    }
 
     if (!committed) {
       const parts = await listCommittableCloudParts(store, manifest);
@@ -263,6 +272,14 @@ export async function completeCloudUpload(
         const present = new Set(parts.map((p) => p.index));
         const missing: number[] = [];
         for (let i = 1; i <= manifest.partCount; i += 1) if (!present.has(i)) missing.push(i);
+        // Every part gone after a commit started, and the object at the key is
+        // not this upload's: another upload sharing the key committed there (on
+        // Azure that discards this upload's uncommitted blocks). Say so — and
+        // drop the marker — rather than report INCOMPLETE forever.
+        if (parts.length === 0 && manifest.commitStartedAt && (await backend.control.stat(sessionOf(manifest).key))) {
+          if (await stillHeld(lock)) await writeManifest(store, withoutMarker(manifest));
+          throw destinationExists();
+        }
         if (missing.length > 0) {
           throw new UploadError('INCOMPLETE', `${missing.length} part(s) have not been uploaded yet.`, { missingParts: missing.slice(0, 50) });
         }
@@ -276,20 +293,45 @@ export async function completeCloudUpload(
 
         // Never commit over an object this upload did not create. Default keys
         // are unique per session, so this guards a custom destination() that is
-        // not. Skipped once the marker exists: an object then is a previous
-        // attempt's own commit (Azure direct: copied but not yet recorded).
+        // not. This look gives the early, friendly refusal; the GUARANTEE is the
+        // commit itself, which the storage refuses atomically when the key is
+        // taken (If-None-Match) — two uploads that both pass this look cannot
+        // both store. Skipped once the marker exists: an object then is a
+        // previous attempt's own commit (Azure direct: copied, not yet recorded).
         const target = sessionOf(manifest).key;
-        if (!manifest.commitStartedAt && (await backend.control.stat(target))) {
-          // No key in the details: it can name another user's file, and it shows
-          // the storage layout. The operator finds it from the upload id.
-          throw new UploadError('DESTINATION_EXISTS', 'A file already exists at this upload\'s storage key; it was not overwritten.');
-        }
+        if (!manifest.commitStartedAt && (await backend.control.stat(target))) throw destinationExists();
 
         // Recorded before the commit so a crash after it is recognisable (see
         // interruptedCommit). A write failure stops here, before anything changes.
+        await lock.confirm();
         manifest = { ...manifest, commitStartedAt: new Date().toISOString() };
-        await store.storage.write?.(manifestKey(store.namespaceKey, uploadId), JSON.stringify(manifest, null, 2));
-        const committedResult = await backend.commit(sessionOf(manifest), parts, declaredType);
+        await writeManifest(store, manifest);
+        let committedResult: CloudCommitResult;
+        try {
+          committedResult = await backend.commit(sessionOf(manifest), parts, declaredType, () => lock.refresh());
+        } catch (err) {
+          if (err instanceof ProviderSessionLostError) throw await restartSession(store, manifest, lock, err);
+          if (!(err instanceof UploadError && err.code === 'DESTINATION_EXISTS')) throw err;
+          const session = sessionOf(manifest);
+          // A failure of the check itself is rethrown with the marker KEPT: clearing
+          // it on a guess would orphan this upload's own commit, if that is what
+          // the refusal met. Recovery still has to prove ownership to use it.
+          if (await backend.holdsOwnCommit(session)) {
+            // Refused by THIS upload's own object: the provider performed the
+            // commit, its response was lost, and the SDK's automatic retry —
+            // conditional on a free key — met the result. The commit is done.
+            const stored = await backend.control.stat(session.key);
+            committedResult = { key: session.key, size: stored?.size ?? 0, checksum: compositeSha256(parts.map((p) => p.sha256)) };
+          } else {
+            // Another upload's object. Nothing of this upload was stored, so no
+            // commit marker may remain — not even one an earlier attempt left:
+            // with it, recovery or a discard could take that object for this
+            // upload's own.
+            if (await stillHeld(lock)) await writeManifest(store, withoutMarker(manifest)).catch(() => undefined);
+            throw err;
+          }
+        }
+        await lock.refresh();
         // Azure verifies only MD5 per block, and when the browser wrote the
         // blocks their ids — which carry each part's SHA-256 — are its choice.
         // Such a composite would be the browser's claim, not a verified value.
@@ -297,13 +339,14 @@ export async function completeCloudUpload(
         result = backend.kind === 'azure_blob' && browserWrote(store, manifest) ? { ...committedResult, checksum: null } : committedResult;
       }
       // The provider consumed the parts, so a refused file cannot be kept for a
-      // retry: it is deleted, with its session (see deleteRefusedFile).
+      // retry: it is deleted, with its session (see refused).
       if (result.size !== manifest.totalBytes) {
         throw await refused(
           store,
           uploadId,
           result.key,
           new UploadError('PART_LENGTH_MISMATCH', `Committed ${result.size} bytes but the upload declared ${manifest.totalBytes}.`),
+          lock,
         );
       }
 
@@ -315,13 +358,20 @@ export async function completeCloudUpload(
         try {
           contentType = await checkHead(head, manifest, namespace, store, options);
         } catch (err) {
-          throw await refused(store, uploadId, result.key, err);
+          throw await refused(store, uploadId, result.key, err, lock);
         }
       }
 
       committed = { key: result.key, size: result.size, contentType, checksum: result.checksum } satisfies CommittedFileRef;
       manifest = { ...manifest, committed };
-      await store.storage.write?.(manifestKey(store.namespaceKey, uploadId), JSON.stringify(manifest, null, 2));
+      // A request that took the lock over (this one stalled past lockStaleMs)
+      // finishes the file itself; recording it here as well would run
+      // onComplete twice. The manifest must also still exist: a lock rewrite
+      // that landed after a taker finished and removed the session would pass
+      // confirm, and writing the manifest would revive that session.
+      await lock.confirm();
+      if (!(await readManifest(store, uploadId))) throw new UploadError('COMPLETE_IN_PROGRESS', 'Another request finished this upload.');
+      await writeManifest(store, manifest);
     }
 
     const file: CompletedFile = {
@@ -337,6 +387,7 @@ export async function completeCloudUpload(
 
     let result: unknown = null;
     if (options.onComplete) {
+      await lock.refresh();
       // On failure the committed file and the manifest stay: a retry re-runs
       // only onComplete. Discard or the sweep removes both if nobody retries.
       result = (await options.onComplete({ file, metadata: manifest.metadata, namespace, uploadId, deduplicated: false })) ?? null;
@@ -347,10 +398,13 @@ export async function completeCloudUpload(
     // upload, data loss for one the app has just recorded. The cloud stores
     // delete a tree key by key in name order (the lock before the manifest), so
     // removing the tree alone left that window open, and a partial failure most
-    // often left exactly the manifest behind.
-    await store.storage.remove(manifestKey(store.namespaceKey, uploadId));
-    // Leftover control files hold no record of the file; the sweep reclaims them.
-    await store.storage.removeTree(sessionKey(store.namespaceKey, uploadId)).catch(() => undefined);
+    // often left exactly the manifest behind. Only while the lock is ours: a
+    // request that took over during a long onComplete is finishing it itself.
+    if (await stillHeld(lock)) {
+      await store.storage.remove(manifestKey(store.namespaceKey, uploadId));
+      // Leftover control files hold no record of the file; the sweep reclaims them.
+      await store.storage.removeTree(sessionKey(store.namespaceKey, uploadId)).catch(() => undefined);
+    }
     return {
       uploadId,
       fileName: manifest.fileName,
@@ -363,40 +417,7 @@ export async function completeCloudUpload(
       result,
     };
   } finally {
-    await store.storage.remove(lockKey(store.namespaceKey, uploadId)).catch(() => undefined);
+    await lock.release().catch(() => undefined);
   }
 }
 
-/**
- * Release everything an abandoned session holds at the provider: the committed
- * file, a file whose commit was never recorded (any size — the marker proves it
- * is this upload's), or the open multipart session.
- */
-async function releaseCloudSession(backend: CloudBackend, manifest: UploadManifest | null): Promise<void> {
-  if (manifest?.committed) return backend.deleteObject(manifest.committed.key);
-  if (!manifest?.cloud) return;
-  // A staged session (Azure direct) keeps its committed blocks in the staging
-  // blob until the copy is done and the staging blob deleted, so "no parts left"
-  // cannot tell there whether the final key holds a copy. Once a commit started,
-  // anything at the final key is that copy: the browser never had a URL for it,
-  // and DESTINATION_EXISTS refused an occupied key before the marker was written.
-  const orphan =
-    manifest.cloud.stagingKey && manifest.commitStartedAt
-      ? await backend.control.stat(manifest.cloud.key).catch(() => null)
-      : await ownCommittedObject(backend, manifest);
-  if (orphan) await backend.deleteObject(manifest.cloud.key);
-  await backend.abortSession(manifest.cloud);
-}
-
-export async function discardCloudUpload(store: StoreContext, uploadId: string): Promise<void> {
-  await releaseCloudSession(backendOf(store), await readManifest(store, uploadId));
-  // Manifest first, as in complete: once it is gone a retried complete finds
-  // NO_SESSION instead of reporting success for a file just deleted.
-  await store.storage.remove(manifestKey(store.namespaceKey, uploadId));
-  await store.storage.removeTree(sessionKey(store.namespaceKey, uploadId));
-}
-
-/** For the sweep: release the provider side of a stale session before its files go. */
-export function cloudSweepRelease(backend: CloudBackend) {
-  return async (dirKey: string) => releaseCloudSession(backend, await backend.control.readJson<UploadManifest>(`${dirKey}/manifest.json`));
-}

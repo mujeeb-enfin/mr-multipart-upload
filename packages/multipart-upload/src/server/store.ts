@@ -49,7 +49,10 @@ export async function listCommittableCloudParts(ctx: StoreContext, manifest: Upl
  * recorded (`committed`: onComplete failed), or not yet (a server stopped
  * mid-complete) — it has consumed the parts, and none can be sent again: S3
  * refuses parts for a completed upload. Every part then counts as received, so
- * a reload sends the browser straight to `complete`, which finishes the file.
+ * a reload sends the browser straight to `complete` — which finishes the file
+ * when it proves to be this upload's commit, and otherwise (another upload's
+ * object at a shared key) refuses with DESTINATION_EXISTS and drops the marker.
+ * Re-sending parts could help in neither case.
  */
 export async function listVerifiedCloudParts(ctx: StoreContext, manifest: UploadManifest): Promise<CloudPart[]> {
   const everyPart = () =>

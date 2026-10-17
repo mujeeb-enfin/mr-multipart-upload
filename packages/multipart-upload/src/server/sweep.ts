@@ -49,7 +49,7 @@ async function measure(storage: StorageAdapter, dirKey: string): Promise<{ bytes
 
 /**
  * `beforeRemove` lets a cloud backend release the provider's side of a stale
- * session (abort the S3 multipart upload, delete the Azure blob) before its
+ * session (abort the S3 multipart upload or the Azure staging blob) before its
  * control files are removed.
  */
 export async function sweepStaleUploads(

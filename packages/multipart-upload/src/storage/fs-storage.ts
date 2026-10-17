@@ -26,13 +26,14 @@
 //
 // `promote` uses rename, which REPLACES an existing destination on both Windows
 // and POSIX — it does not throw EEXIST. That was verified by running it after a
-// comment claimed otherwise. Dedupe therefore happens in the uploader, which
-// checks for the destination before promoting.
+// comment claimed otherwise. Publishing a finished file therefore goes through
+// `promoteExclusive`, a hard link that refuses an existing destination, so the
+// "is it there already?" check and the publish are one atomic step.
 // ---------------------------------------------------------------------------
 
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
+import { link, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -173,6 +174,32 @@ export class FsStorage implements StorageAdapter {
     const to = this.path(toKey);
     await mkdir(dirname(to), { recursive: true });
     await rename(this.path(fromKey), to);
+  }
+
+  async promoteExclusive(fromKey: string, toKey: string): Promise<'moved' | 'exists'> {
+    const from = this.path(fromKey);
+    const to = this.path(toKey);
+    await mkdir(dirname(to), { recursive: true });
+    try {
+      // `rename` replaces an existing target; `link` refuses one (EEXIST), so the
+      // check and the publish are one atomic step. The staging name goes after.
+      await link(from, to);
+    } catch (err) {
+      if (isErrno(err, 'EEXIST')) return 'exists';
+      // A filesystem without hard links (FAT, some network shares): check, then
+      // move — two concurrent completes onto one key could interleave there.
+      if (isErrno(err, 'EPERM') || isErrno(err, 'ENOTSUP') || isErrno(err, 'EOPNOTSUPP') || isErrno(err, 'EXDEV')) {
+        if (await this.stat(toKey)) return 'exists';
+        await rename(from, to);
+        return 'moved';
+      }
+      throw err;
+    }
+    // Published already: a staging name that cannot be removed now (a Windows
+    // virus scanner holding it, say) must not turn a stored file into a failed
+    // complete. The caller's cleanup and the sweep remove it later.
+    await unlink(from).catch(() => undefined);
+    return 'moved';
   }
 
   openRead(key: string): ReadableStream<Uint8Array> {

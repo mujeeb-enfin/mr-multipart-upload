@@ -18,14 +18,8 @@ import { assertSafeUploadId } from '../core/slug.js';
 import { FsStorage } from '../storage/fs-storage.js';
 import type { DirectPartRequest } from '../storage/cloud/types.js';
 import { cloudBackendFor } from './cloud-backends.js';
-import {
-  cloudSweepRelease,
-  completeCloudUpload,
-  discardCloudUpload,
-  openCloudSession,
-  presignCloudPart,
-  storeCloudPart,
-} from './cloud-flow.js';
+import { cloudSweepRelease, discardCloudUpload } from './cloud-control.js';
+import { completeCloudUpload, openCloudSession, presignCloudPart, storeCloudPart } from './cloud-flow.js';
 import { completeUpload, DEFAULT_LOCK_STALE_MS, discardUnderLock, type CompleteHookInput, type CompleteResult } from './complete.js';
 import { type ConfigOverrides, type ResolvedConfig, resolveConfig } from './config.js';
 import { assertDeclaredTypeAllowed, declaredTypeFor } from './file-types.js';

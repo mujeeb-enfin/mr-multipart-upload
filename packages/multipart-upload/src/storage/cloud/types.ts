@@ -41,6 +41,18 @@ export interface DirectPartRequest {
   readonly expiresAt: string;
 }
 
+/**
+ * The provider dropped the session's multipart upload during the commit (S3:
+ * 409 ConditionalRequestConflict — a concurrent write of the key won, and the
+ * upload "must be re-initiated"). Its parts are gone; nothing was stored.
+ */
+export class ProviderSessionLostError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderSessionLostError';
+  }
+}
+
 export interface CloudCommitResult {
   readonly key: string;
   readonly size: number;
@@ -80,8 +92,27 @@ export interface CloudBackend {
   ): Promise<DirectPartRequest>;
   /** Every part the provider holds for the session. */
   listParts(session: CloudSessionRef): Promise<CloudPart[]>;
-  /** Commit `parts` (ascending, complete) into the final object. */
-  commit(session: CloudSessionRef, parts: readonly CloudPart[], contentType: string): Promise<CloudCommitResult>;
+  /**
+   * Commit `parts` (ascending, complete) into the final object — refusing with
+   * DESTINATION_EXISTS, atomically, when an object this session did not create
+   * already holds the key. `heartbeat` is called during a long commit (Azure's
+   * copy), so the complete lock is not mistaken for an abandoned one.
+   */
+  commit(
+    session: CloudSessionRef,
+    parts: readonly CloudPart[],
+    contentType: string,
+    heartbeat?: () => Promise<void>,
+  ): Promise<CloudCommitResult>;
+  /**
+   * True when the object at the session's key is THIS session's own commit —
+   * proved from the provider, not guessed from "something is there": an S3
+   * object carries, in its metadata, the tag of the multipart upload whose
+   * completion created it (untagged legacy sessions: no parts left); an Azure
+   * blob's committed blocks carry the session's tag; an Azure staged copy
+   * records the session's staging blob as its source.
+   */
+  holdsOwnCommit(session: CloudSessionRef): Promise<boolean>;
   /** The first `byteCount` bytes of a committed object. */
   readObjectHead(key: string, byteCount: number): Promise<Uint8Array>;
   /** Delete a committed object. Absent is success. */

@@ -17,15 +17,14 @@
 // available with it.
 // ---------------------------------------------------------------------------
 
-import { createHash } from 'node:crypto';
-import { Readable } from 'node:stream';
+import { createHash, randomBytes } from 'node:crypto';
 
 import type * as AzureBlob from '@azure/storage-blob';
 import type * as AzureIdentity from '@azure/identity';
 
-import { UploadError } from '../../core/errors.js';
+import { UploadError, destinationExists } from '../../core/errors.js';
 import type { CloudSessionRef } from '../../core/session.js';
-import type { StorageAdapter, StoredObjectInfo } from '../adapter.js';
+import { AzureControlStore, statusOf, toBuffer } from './azure-control-store.js';
 import { azureBlockId, compositeSha256, parseAzureBlockId } from './checksums.js';
 import { loadOptional } from './load-optional.js';
 import type { CloudBackend, CloudCommitResult, CloudPart, DirectPartRequest } from './types.js';
@@ -47,19 +46,31 @@ export const AZURE_DIRECT_API_VERSION = '2025-01-05';
 
 type Sdk = typeof AzureBlob;
 
-function statusOf(err: unknown): number | undefined {
-  return (err as { statusCode?: number } | null)?.statusCode;
+/**
+ * Azure refusing a write because the blob is already there: 409
+ * BlobAlreadyExists, 412 ConditionNotMet / TargetConditionNotMet (Azure and
+ * Azurite word an unmet `If-None-Match` differently), or 409
+ * PendingCopyOperation (a copy onto it is still running). A 409 alone is not
+ * enough — it also means a lease. The caller then looks at who holds the blob.
+ */
+function isTaken(err: unknown): boolean {
+  const code = (err as { code?: string } | null)?.code;
+  if (code === 'SourceConditionNotMet') return false;
+  return (
+    code === 'BlobAlreadyExists' ||
+    code === 'ConditionNotMet' ||
+    code === 'TargetConditionNotMet' ||
+    code === 'PendingCopyOperation' ||
+    (statusOf(err) === 412 && code === undefined)
+  );
 }
 
-function toBuffer(data: Uint8Array | string): Buffer {
-  return typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-}
+/** Metadata stamped on the final blob BY the copy, naming the session that made it. */
+const SESSION_METADATA = 'mpusession';
 
-async function collect(stream: NodeJS.ReadableStream | undefined): Promise<Uint8Array> {
-  if (!stream) return new Uint8Array(0);
-  const chunks: Buffer[] = [];
-  for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
-  return Buffer.concat(chunks);
+/** Azure refusing a copy because its SOURCE no longer matches (`sourceConditions.ifMatch`). */
+function isSourceChanged(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === 'SourceConditionNotMet';
 }
 
 /** Account name from a connection string, an explicit setting, or the URL. */
@@ -77,115 +88,6 @@ function connectionStringValue(cs: string, name: string): string | undefined {
     if (eq > 0 && part.slice(0, eq).trim().toLowerCase() === name.toLowerCase()) return part.slice(eq + 1).trim();
   }
   return undefined;
-}
-
-class AzureControlStore implements StorageAdapter {
-  constructor(
-    private readonly container: AzureBlob.ContainerClient,
-    private readonly prefix: string,
-  ) {}
-
-  private blob(key: string): AzureBlob.BlockBlobClient {
-    return this.container.getBlockBlobClient(`${this.prefix}${key}`);
-  }
-
-  async stat(key: string): Promise<StoredObjectInfo | null> {
-    try {
-      const props = await this.blob(key).getProperties();
-      return { size: props.contentLength ?? 0, modifiedMs: props.lastModified?.getTime() ?? 0, isDirectory: false };
-    } catch (err) {
-      if (statusOf(err) !== 404) throw err;
-    }
-    for await (const item of this.container.listBlobsFlat({ prefix: `${this.prefix}${key}/` })) {
-      return { size: 0, modifiedMs: item.properties.lastModified?.getTime() ?? 0, isDirectory: true };
-    }
-    return null;
-  }
-
-  async list(dirKey: string): Promise<string[]> {
-    const prefix = `${this.prefix}${dirKey}/`;
-    const names: string[] = [];
-    for await (const item of this.container.listBlobsByHierarchy('/', { prefix })) {
-      const name = item.kind === 'prefix' ? item.name.slice(prefix.length, -1) : item.name.slice(prefix.length);
-      if (name) names.push(name);
-    }
-    return names;
-  }
-
-  async readJson<T>(key: string): Promise<T | null> {
-    try {
-      return JSON.parse((await this.blob(key).downloadToBuffer()).toString('utf8')) as T;
-    } catch (err) {
-      if (statusOf(err) === 404 || err instanceof SyntaxError) return null;
-      throw err;
-    }
-  }
-
-  async createExclusive(key: string, data: Uint8Array | string): Promise<'created' | 'exists'> {
-    const body = toBuffer(data);
-    try {
-      await this.blob(key).upload(body, body.byteLength, { conditions: { ifNoneMatch: '*' } });
-      return 'created';
-    } catch (err) {
-      if (statusOf(err) === 409 || statusOf(err) === 412) return 'exists';
-      throw err;
-    }
-  }
-
-  async write(key: string, data: Uint8Array | string): Promise<void> {
-    const body = toBuffer(data);
-    await this.blob(key).upload(body, body.byteLength);
-  }
-
-  async remove(key: string): Promise<void> {
-    await this.blob(key).deleteIfExists();
-  }
-
-  async removeTree(dirKey: string): Promise<void> {
-    const names: string[] = [];
-    for await (const item of this.container.listBlobsFlat({ prefix: `${this.prefix}${dirKey}/` })) names.push(item.name);
-    for (const name of names) await this.container.getBlockBlobClient(name).deleteIfExists();
-  }
-
-  async readHead(key: string, byteCount: number): Promise<Uint8Array> {
-    if (byteCount <= 0) return new Uint8Array(0);
-    try {
-      const res = await this.blob(key).download(0, byteCount);
-      return await collect(res.readableStreamBody);
-    } catch (err) {
-      if (statusOf(err) === 416) return new Uint8Array(0); // empty blob
-      throw err;
-    }
-  }
-
-  async assemble(): Promise<never> {
-    throw new Error('Azure control store does not assemble files; parts use Put Block / Put Block List.');
-  }
-
-  async promote(): Promise<never> {
-    throw new Error('Azure control store does not move files.');
-  }
-
-  openRead(key: string): ReadableStream<Uint8Array> {
-    const blob = this.blob(key);
-    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-    return new ReadableStream<Uint8Array>({
-      async pull(controller) {
-        if (!reader) {
-          const res = await blob.download();
-          const body = res.readableStreamBody;
-          if (!body) return controller.close();
-          reader = (Readable.toWeb(body as Readable) as ReadableStream<Uint8Array>).getReader();
-        }
-        const { done, value } = await reader.read();
-        if (done) controller.close();
-        else controller.enqueue(value);
-      },
-      async cancel(reason) {
-        await reader?.cancel(reason);
-      },
-    });
-  }
 }
 
 export async function createAzureBackend(config: AzureBackendConfig): Promise<CloudBackend> {
@@ -285,17 +187,62 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
     const byIndex = new Map<number, CloudPart>();
     for (const block of [...(list.committedBlocks ?? []), ...(list.uncommittedBlocks ?? [])]) {
       const parsed = parseAzureBlockId(block.name);
-      if (parsed) byIndex.set(parsed.index, { index: parsed.index, size: block.size, sha256: parsed.sha256 });
+      // Only THIS session's blocks: another session sharing the blob (a
+      // non-unique destination()) carries a different tag.
+      if (parsed && parsed.sessionTag === session.blockTag) {
+        byIndex.set(parsed.index, { index: parsed.index, size: block.size, sha256: parsed.sha256 });
+      }
     }
     return [...byIndex.values()].sort((a, b) => a.index - b.index);
   }
 
   /**
    * Longest a `complete` waits for Azure's copy. Same-account copies normally
-   * finish at once, but Azure does not promise it; this stays well under the
-   * 15-minute complete lock, so the lock cannot go stale under a running copy.
+   * finish at once, but Azure does not promise it. The complete lock is kept
+   * fresh meanwhile by the heartbeat.
    */
   const COPY_DEADLINE_MS = 10 * 60_000;
+  /** How often, at most, the heartbeat refreshes the complete lock during a copy. */
+  const HEARTBEAT_EVERY_MS = 30_000;
+
+  /**
+   * Whether the blob at the final key is a copy THIS session made, and its copy
+   * state. Two proofs, either enough: the metadata the copy itself stamped
+   * (SESSION_METADATA = the session's block tag), and the recorded copy source
+   * (this session's staging blob). Azure drops the copy properties once a blob
+   * is modified after its copy — nothing here modifies the final blob, but the
+   * metadata does not depend on that. A missing blob is nobody's copy.
+   */
+  async function holdsOwnCopy(session: CloudSessionRef & { stagingKey: string }) {
+    const final = blob(session.key);
+    const props = await final.getProperties().catch((err: unknown) => {
+      if (statusOf(err) === 404) return null;
+      throw err;
+    });
+    if (!props) return { own: false, status: undefined, copyId: undefined };
+    const source = props.copySource ? new URL(props.copySource).pathname : '';
+    const bySource = source !== '' && source === new URL(blob(session.stagingKey).url).pathname;
+    const byStamp = session.blockTag !== undefined && props.metadata?.[SESSION_METADATA] === session.blockTag;
+    // Without copy properties a concluded copy reads as no status; it concluded.
+    return { own: bySource || byStamp, status: props.copyStatus ?? 'success', copyId: props.copyId };
+  }
+
+  /** Resolves after `ms`, event-driven (no timers). */
+  const pause = (ms: number) =>
+    new Promise<void>((resolve) => AbortSignal.timeout(ms).addEventListener('abort', () => resolve(), { once: true }));
+
+  /** Wait for a copy already running onto `final` (a stopped attempt's own), at most COPY_DEADLINE_MS. */
+  async function awaitRunningCopy(final: AzureBlob.BlockBlobClient, beat: () => void): Promise<void> {
+    const until = Date.now() + COPY_DEADLINE_MS;
+    for (;;) {
+      const status = (await final.getProperties()).copyStatus;
+      if (status === 'success') return;
+      if (status !== 'pending') throw new Error(`Azure copy to the final key ended "${status ?? 'unknown'}"`);
+      if (Date.now() > until) throw new Error('Azure copy to the final key did not finish in time');
+      beat();
+      await pause(1000);
+    }
+  }
 
   /**
    * Direct transfer: copy the committed staging blob to the final key with the
@@ -305,19 +252,80 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
   async function copyToFinal(
     session: CloudSessionRef & { stagingKey: string },
     stagingEtag: string | undefined,
-    contentType: string,
     checksum: CloudCommitResult['checksum'],
+    heartbeat: (() => Promise<void>) | undefined,
   ): Promise<CloudCommitResult> {
     const staging = blob(session.stagingKey);
     const final = blob(session.key);
     const { sas } = await blobSas(`${config.prefix}${session.stagingKey}`, 'r', new Date(Date.now() + COPY_DEADLINE_MS + 3_600_000));
-    // Only the blob just committed: the browser's SAS is still valid, and if it
-    // replaced the staging blob since, the copy fails (412) instead of storing
-    // other bytes.
-    const poller = await final.beginCopyFromURL(`${staging.url}?${sas}`, {
-      intervalInMs: 1000,
-      ...(stagingEtag ? { sourceConditions: { ifMatch: stagingEtag } } : {}),
-    });
+    // Keeps the complete lock fresh while Azure copies: one refresh at a time,
+    // at most every HEARTBEAT_EVERY_MS, and awaited before returning — a refresh
+    // still running after the commit could otherwise rewrite a lock that the
+    // complete has since released.
+    let beating: Promise<void> | null = null;
+    let lastBeat = Date.now();
+    const beat = () => {
+      if (!heartbeat || beating || Date.now() - lastBeat < HEARTBEAT_EVERY_MS) return;
+      lastBeat = Date.now();
+      beating = heartbeat()
+        .catch(() => undefined) // a takeover is caught by the caller's own refresh after the commit
+        .finally(() => {
+          beating = null;
+        });
+    };
+    const startCopy = (onlyIfFree: boolean) =>
+      final.beginCopyFromURL(`${staging.url}?${sas}`, {
+        intervalInMs: 1000,
+        onProgress: beat,
+        // Set BY the copy: proof the result is this session's (holdsOwnCopy).
+        ...(session.blockTag ? { metadata: { [SESSION_METADATA]: session.blockTag } } : {}),
+        // Only the blob just committed: the browser's SAS is still valid, and if
+        // it replaced the staging blob since, the copy fails instead of storing
+        // other bytes.
+        ...(stagingEtag ? { sourceConditions: { ifMatch: stagingEtag } } : {}),
+        // Only onto a free key — atomically, whatever destination() returned.
+        ...(onlyIfFree ? { conditions: { ifNoneMatch: '*' } } : {}),
+      });
+
+    try {
+      let poller: Awaited<ReturnType<typeof startCopy>> | null = null;
+      try {
+        poller = await startCopy(true);
+      } catch (err) {
+        if (isSourceChanged(err)) {
+          throw new Error('The staged parts changed during the commit (the staging blob was rewritten); send the file again.');
+        }
+        if (!isTaken(err)) throw err;
+        // Taken. By this session's own earlier copy — a retry after a complete
+        // that stopped after copying, or the SDK retrying a start whose response
+        // was lost — it is reused, awaited while still running, or copied again
+        // if it failed; by anything else it is refused, untouched.
+        const existing = await holdsOwnCopy(session);
+        if (!existing.own) throw destinationExists();
+        if (existing.status === 'pending') await awaitRunningCopy(final, beat);
+        else if (existing.status !== 'success') poller = await startCopy(false);
+      }
+      if (poller) await waitForCopy(poller, final);
+    } finally {
+      await beating;
+    }
+    // The content type is the server's: commitBlockList set it on the staging
+    // blob, and the copy is conditional on that blob's ETag — which changes if
+    // the browser alters its properties too. The final blob is NOT modified
+    // after the copy (Azure would drop its copy properties, an ownership proof).
+    // The size is the COPY's, not the parts' sum.
+    const size = (await final.getProperties()).contentLength ?? 0;
+    // The file is stored; a staging blob left behind lies inside the session
+    // directory, which complete, discard and the sweep all remove.
+    await staging.deleteIfExists().catch(() => undefined);
+    return { key: session.key, size, checksum };
+  }
+
+  /** Wait for a server-side copy, at most COPY_DEADLINE_MS; a copy still pending then is aborted. */
+  async function waitForCopy(
+    poller: Awaited<ReturnType<AzureBlob.BlockBlobClient['beginCopyFromURL']>>,
+    final: AzureBlob.BlockBlobClient,
+  ): Promise<void> {
     let copied: AzureBlob.BlobBeginCopyFromURLResponse;
     // This SDK's poller takes no abort signal, so the deadline is a race with
     // the signal's abort event.
@@ -336,15 +344,6 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
       throw err;
     }
     if (copied.copyStatus !== 'success') throw new Error(`Azure copy to the final key ended "${copied.copyStatus ?? 'unknown'}"`);
-    // A copy carries the source's properties, and the browser's SAS can set the
-    // staging blob's: the stored file's type is the server's again.
-    await final.setHTTPHeaders({ blobContentType: contentType });
-    // The size is the COPY's, not the parts' sum.
-    const size = (await final.getProperties()).contentLength ?? 0;
-    // The file is stored; a staging blob left behind lies inside the session
-    // directory, which complete, discard and the sweep all remove.
-    await staging.deleteIfExists().catch(() => undefined);
-    return { key: session.key, size, checksum };
   }
 
   return {
@@ -354,29 +353,34 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
     supportsDirect: Boolean(sharedKey) || usesEntraId,
 
     async createSession(key, _contentType, stagingKey) {
-      return { kind: 'azure_blob', key, ...(stagingKey ? { stagingKey } : {}) };
+      return { kind: 'azure_blob', key, blockTag: randomBytes(8).toString('hex'), ...(stagingKey ? { stagingKey } : {}) };
     },
 
     async abortSession(session) {
-      // A staging blob is this session's alone, committed or not.
       if (session.stagingKey) {
+        // A copy this session started at the final key — still running, failed
+        // or aborted — goes with it (a running one is stopped first); a finished
+        // one is the caller's to judge (releaseCloudSession). The staging blob is
+        // this session's alone, committed or not.
+        const staged = session as CloudSessionRef & { stagingKey: string };
+        const copy = await holdsOwnCopy(staged).catch(() => ({ own: false, status: undefined, copyId: undefined }));
+        if (copy.own && copy.status !== 'success') {
+          if (copy.status === 'pending' && copy.copyId) await blob(session.key).abortCopyFromURL(copy.copyId).catch(() => undefined);
+          await blob(session.key).deleteIfExists();
+        }
         await blob(session.stagingKey).deleteIfExists();
         return;
       }
-      const target = blob(session.key);
-      // A COMMITTED blob at the final key is a stored file and must survive —
-      // keys are unique per session, but a custom destination() may not be.
-      // exists() is false while the blob holds only uncommitted blocks; Azure
-      // drops those left on a committed blob at its next commit, or after 7 days.
-      if (await target.exists()) return;
-      // Deleting the blob discards its uncommitted blocks with it.
-      await target.deleteIfExists();
+      // Proxy: the uncommitted blocks sit on the final blob, and deleting it is
+      // not safe — between a look ("no stored file there yet") and the delete,
+      // another upload given the same key by a custom destination() may commit
+      // its file there. Azure discards uncommitted blocks itself after 7 days.
     },
 
     async putPart(session, index, bytes, sha256) {
       const body = toBuffer(bytes);
       const md5 = createHash('md5').update(body).digest();
-      await partsBlob(session).stageBlock(azureBlockId(index, sha256), body, body.byteLength, { transactionalContentMD5: md5 });
+      await partsBlob(session).stageBlock(azureBlockId(index, sha256, session.blockTag), body, body.byteLength, { transactionalContentMD5: md5 });
     },
 
     async presignPart(session, index, _length, sha256, md5Base64, ttlSeconds): Promise<DirectPartRequest> {
@@ -392,7 +396,7 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
       const target = blob(session.stagingKey);
       // Write only, one blob, short-lived — and never past its signing key.
       const { sas, expiresOn } = await blobSas(`${config.prefix}${session.stagingKey}`, 'w', new Date(Date.now() + ttlSeconds * 1000));
-      const blockId = encodeURIComponent(azureBlockId(index, sha256));
+      const blockId = encodeURIComponent(azureBlockId(index, sha256, session.blockTag));
       return {
         url: `${target.url}?comp=block&blockid=${blockId}&${sas}`,
         method: 'PUT',
@@ -403,15 +407,56 @@ export async function createAzureBackend(config: AzureBackendConfig): Promise<Cl
 
     listParts,
 
-    async commit(session, parts, contentType): Promise<CloudCommitResult> {
+    async commit(session, parts, contentType, heartbeat): Promise<CloudCommitResult> {
       const ordered = [...parts].sort((a, b) => a.index - b.index);
-      const committedBlocks = await partsBlob(session).commitBlockList(
-        ordered.map((p) => azureBlockId(p.index, p.sha256 as string)),
-        { blobHTTPHeaders: { blobContentType: contentType } },
-      );
+      let committedBlocks: AzureBlob.BlockBlobCommitBlockListResponse;
+      try {
+        committedBlocks = await partsBlob(session).commitBlockList(
+          ordered.map((p) => azureBlockId(p.index, p.sha256 as string, session.blockTag)),
+          {
+            blobHTTPHeaders: { blobContentType: contentType },
+            // Proxy: the blocks sit on the final blob itself, so the commit is
+            // made only if it holds no stored file yet — atomically, whatever
+            // destination() returned. (A blob with only uncommitted blocks does
+            // not exist yet.) A staging blob is this session's own.
+            ...(session.stagingKey ? {} : { conditions: { ifNoneMatch: '*' } }),
+          },
+        );
+      } catch (err) {
+        if (isTaken(err)) throw destinationExists();
+        throw err;
+      }
       const checksum = compositeSha256(ordered.map((p) => p.sha256));
       if (!session.stagingKey) return { key: session.key, size: ordered.reduce((sum, p) => sum + p.size, 0), checksum };
-      return copyToFinal(session as CloudSessionRef & { stagingKey: string }, committedBlocks.etag, contentType, checksum);
+      return copyToFinal(session as CloudSessionRef & { stagingKey: string }, committedBlocks.etag, checksum, heartbeat);
+    },
+
+    async holdsOwnCommit(session) {
+      const final = blob(session.key);
+      // Direct: the final blob is a finished copy this session made.
+      if (session.stagingKey) {
+        const copy = await holdsOwnCopy(session as CloudSessionRef & { stagingKey: string });
+        return copy.own && copy.status === 'success';
+      }
+      // Proxy: every committed block carries this session's tag. A session
+      // started before tags existed cannot prove anything — another such
+      // session's file would look the same — so it never claims ownership.
+      if (!session.blockTag) return false;
+      let list: AzureBlob.BlockBlobGetBlockListResponse;
+      try {
+        list = await final.getBlockList('committed');
+      } catch (err) {
+        if (statusOf(err) === 404) return false;
+        throw err;
+      }
+      const blocks = list.committedBlocks ?? [];
+      return (
+        blocks.length > 0 &&
+        blocks.every((block) => {
+          const parsed = parseAzureBlockId(block.name);
+          return parsed !== null && parsed.sessionTag === session.blockTag;
+        })
+      );
     },
 
     readObjectHead: (key, byteCount) => control.readHead(key, byteCount),

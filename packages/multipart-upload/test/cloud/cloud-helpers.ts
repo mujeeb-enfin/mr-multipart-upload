@@ -59,6 +59,49 @@ export function storageOptions(kind: CloudKind, bucket: string, extra: StorageOv
   return { ...base, azure: { container: bucket, connectionString: azureConnection as string } };
 }
 
+/**
+ * A gate a test opens by hand, with a deadline: `wait()` resolves on `open()`,
+ * or rejects after `deadlineMs` — shorter than the 30 s test timeout, so a
+ * regression that never opens it fails with a message instead of hanging the
+ * file (and leaving a patched backend behind for the tests after it).
+ */
+export function openable(deadlineMs = 20_000): { open: () => void; wait: () => Promise<void> } {
+  let open!: () => void;
+  const opened = new Promise<void>((resolve) => (open = resolve));
+  const gaveUp = new Promise<never>((_, reject) => {
+    AbortSignal.timeout(deadlineMs).addEventListener('abort', () => reject(new Error(`gate not opened within ${deadlineMs} ms`)), { once: true });
+  });
+  gaveUp.catch(() => undefined);
+  return { open, wait: () => Promise.race([opened, gaveUp]) };
+}
+
+/**
+ * A meeting point: `arrive()` resolves once `parties` callers have arrived — to
+ * hold concurrent requests at the same step, so a race is forced, not hoped for.
+ */
+export function barrier(parties: number, deadlineMs = 20_000): { arrive: () => Promise<void> } {
+  let arrived = 0;
+  let open!: () => void;
+  const allThere = new Promise<void>((resolve) => (open = resolve));
+  // If a party fails before it arrives, the others must fail too — loudly, at a
+  // deadline — instead of waiting forever with a patched backend left in place.
+  const gaveUp = new Promise<never>((_, reject) => {
+    AbortSignal.timeout(deadlineMs).addEventListener(
+      'abort',
+      () => reject(new Error(`barrier: only ${arrived} of ${parties} parties arrived within ${deadlineMs} ms`)),
+      { once: true },
+    );
+  });
+  gaveUp.catch(() => undefined); // observed only through the race below
+  return {
+    arrive: async () => {
+      arrived += 1;
+      if (arrived === parties) open();
+      await Promise.race([allThere, gaveUp]);
+    },
+  };
+}
+
 /** A raw Azure blob client, to set up provider state a test needs (azure_blob only). */
 export async function azureBlob(container: string, name: string) {
   const { BlobServiceClient } = await import('@azure/storage-blob');

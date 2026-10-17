@@ -67,7 +67,9 @@ export type UploadErrorCode =
   /**
    * Cloud storage: an object this upload did not create already exists at its
    * storage key — usually a custom `destination()` that returns the same key for
-   * different uploads. Nothing is overwritten; the parts are kept.
+   * different uploads. Nothing is overwritten (the commit is conditional). The
+   * parts are kept, except on Azure with proxy transfer when the other upload
+   * committed onto the same blob: Azure discards its uncommitted blocks.
    */
   | 'DESTINATION_EXISTS';
 
@@ -116,4 +118,14 @@ export class UploadError extends Error {
 
 export function isUploadError(err: unknown): err is UploadError {
   return err instanceof UploadError;
+}
+
+/**
+ * The refusal for a commit onto an object this upload did not create — raised
+ * by the early look and by the storage's own atomic refusal alike. No key in
+ * the details: it can name another user's file, and it shows the storage
+ * layout; the operator finds it from the upload id.
+ */
+export function destinationExists(): UploadError {
+  return new UploadError('DESTINATION_EXISTS', 'A file already exists at this upload\'s storage key; it was not overwritten.');
 }

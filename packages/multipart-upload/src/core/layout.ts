@@ -105,8 +105,35 @@ export function stagingKey(namespaceKey: string, uploadId: string): string {
   return `${sessionKey(namespaceKey, uploadId)}/${STAGING_FILE}`;
 }
 
+/**
+ * The assembly file of one lock generation: `assembled.<n>.bin`. Per holder, so
+ * a holder that was taken over — still assembling, or cleaning up after itself —
+ * can never delete or overwrite the file the new holder is assembling.
+ */
+export function stagingKeyForGeneration(namespaceKey: string, uploadId: string, generation: number): string {
+  return `${sessionKey(namespaceKey, uploadId)}/assembled.${generation}.bin`;
+}
+
 export function lockKey(namespaceKey: string, uploadId: string): string {
   return `${sessionKey(namespaceKey, uploadId)}/${LOCK_FILE}`;
+}
+
+/**
+ * One GENERATION of the `complete` lock: `completing.<n>.lock`. Taking over an
+ * abandoned lock creates generation n+1 exclusively instead of deleting and
+ * re-creating one name, so two takers can never both win (see server/lock.ts).
+ * Generation 0 is the single-name `completing.lock` of earlier versions.
+ */
+export function lockGenerationKey(namespaceKey: string, uploadId: string, generation: number): string {
+  return generation === 0 ? lockKey(namespaceKey, uploadId) : `${sessionKey(namespaceKey, uploadId)}/completing.${generation}.lock`;
+}
+
+/** The generation a session-directory entry is a lock of, or null when it is not a lock. */
+export function parseLockFileName(name: string): number | null {
+  if (name === LOCK_FILE) return 0;
+  // Up to 15 digits: far beyond any number of takeovers, and exact as a JS number.
+  const match = /^completing\.([1-9][0-9]{0,14})\.lock$/.exec(name);
+  return match ? Number(match[1]) : null;
 }
 
 export function headKey(namespaceKey: string, uploadId: string): string {

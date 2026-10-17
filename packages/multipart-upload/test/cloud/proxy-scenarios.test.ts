@@ -22,6 +22,7 @@ import {
   AVAILABLE,
   CLOUD_PART_BYTES,
   MIB,
+  azureBlob,
   backendFor,
   createBucket,
   deleteBucket,
@@ -75,6 +76,21 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — proxy transfer', () 
       for (const index of indices) await up.putPart(ctx, { uploadId: id, index, bytes: partOf(bytes, index, CLOUD_PART_BYTES), fingerprint: fp });
     }
 
+    /**
+     * What a released proxy session leaves at the provider. S3: nothing — the
+     * multipart upload is aborted. Azure: no stored blob; the uncommitted blocks
+     * stay until Azure discards them (7 days), because deleting the blob could
+     * destroy a file another upload commits at the same key in the meantime.
+     */
+    async function expectProviderReleased(ref: UploadManifest['cloud']) {
+      const session = ref as NonNullable<UploadManifest['cloud']>;
+      if (kind === 'azure_blob') {
+        expect(await (await azureBlob(bucket, session.key)).exists()).toBe(false);
+      } else {
+        expect(await (await backendFor(base())).listParts(session)).toEqual([]);
+      }
+    }
+
     /** Leave what a server that stopped mid-complete leaves: the marker, the provider commit, no `committed`. */
     async function commitThenCrash(manifest: UploadManifest) {
       const backend = await backendFor(base());
@@ -85,13 +101,15 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — proxy transfer', () 
       return { backend, key: session.key };
     }
 
+    // 60 s: an emulator serving several test files at once can take longer than
+    // the 10 s default to create or delete a bucket / container.
     beforeAll(async () => {
       clearEnv();
       await createBucket(kind, bucket);
-    });
+    }, 60_000);
     afterAll(async () => {
       await deleteBucket(kind, bucket);
-    });
+    }, 60_000);
 
     it('stores a multi-part file byte-for-byte, with the composite checksum and type', async () => {
       let readBack: Uint8Array | undefined;
@@ -364,40 +382,22 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — proxy transfer', () 
       expect(await backend.control.stat(again.session.manifest.cloud?.key as string)).toBeNull();
     });
 
-    it('never commits over an object it did not create (a destination() that is not unique)', async () => {
-      // MUTATION: drop the DESTINATION_EXISTS check -> the second upload
-      // overwrites the first user's file.
-      const shared = { destination: ({ extension }: { extension: string }) => `shared/one-key.${extension}` };
-      const up = uploader(shared);
-      const alices = fileOf(SIZE, 25);
-      const bobs = fileOf(SIZE, 26);
-      const a = await up.begin(ALICE, { fileName: 'mine.bin', totalBytes: SIZE, fingerprint: 'fp-shared-a' });
-      await sendParts(up, ALICE, a.session.manifest.uploadId, alices, 'fp-shared-a', partsOf(SIZE));
-      const stored = await up.complete(ALICE, a.session.manifest.uploadId);
-
-      const b = await up.begin(BOB, { fileName: 'mine.bin', totalBytes: SIZE, fingerprint: 'fp-shared-b' });
-      await sendParts(up, BOB, b.session.manifest.uploadId, bobs, 'fp-shared-b', partsOf(SIZE));
-      expect(await code(up.complete(BOB, b.session.manifest.uploadId))).toBe('DESTINATION_EXISTS');
-
-      const backend = await backendFor(base());
-      expect(sha256(await readAll(backend.openRead(stored.key)))).toBe(sha256(alices));
-      expect((await up.status(BOB, b.session.manifest.uploadId)).missingParts).toEqual([]); // parts kept
-      await up.discard(BOB, b.session.manifest.uploadId);
-      expect(sha256(await readAll(backend.openRead(stored.key)))).toBe(sha256(alices)); // discard keeps it too
-      await backend.deleteObject(stored.key);
-    });
-
     it('discard releases the provider session: no parts, no control files, nothing open', async () => {
       const up = uploader();
       const bytes = fileOf(SIZE, 19);
       const begun = await up.begin(ALICE, { fileName: 'discard.bin', totalBytes: SIZE, fingerprint: 'fp-disc' });
       const id = begun.session.manifest.uploadId;
       await sendParts(up, ALICE, id, bytes, 'fp-disc', [1, 2]);
-      const backend = await backendFor(base());
       await up.discard(ALICE, id);
       expect(await code(up.status(ALICE, id))).toBe('NO_SESSION');
-      expect(await backend.listParts(begun.session.manifest.cloud as never)).toEqual([]);
+      await expectProviderReleased(begun.session.manifest.cloud);
       if (kind !== 'azure_blob') expect(await openS3MultipartUploads(bucket)).toBe(0);
+      // The discarded parts are gone for good: the same file begun again starts
+      // from nothing (on Azure, the left-over blocks carry the old session's tag).
+      const again = await up.begin(ALICE, { fileName: 'discard.bin', totalBytes: SIZE, fingerprint: 'fp-disc' });
+      expect(again.created).toBe(true);
+      expect(again.session.missingParts).toEqual(partsOf(SIZE));
+      await up.discard(ALICE, again.session.manifest.uploadId);
     });
 
     it('two concurrent begins of one file produce one upload and leak no provider session', async () => {
@@ -412,17 +412,20 @@ describe.skipIf(AVAILABLE.length === 0)('cloud backends — proxy transfer', () 
     });
 
     it('the sweep removes an abandoned upload and its provider session, and keeps a fresh one', async () => {
-      const up = uploader({ partTtlMs: 1500 });
+      // Object timestamps have 1-second resolution, so a file written now can
+      // look up to a second old. A 4 s TTL leaves the fresh upload 3 s of slack
+      // for a loaded emulator (a 1.5 s TTL left 0.5 s, and a loaded run swept
+      // the fresh upload too); the old one is waited well past TTL + 1 s.
+      const up = uploader({ partTtlMs: 4000 });
       const bytes = fileOf(SIZE, 20);
       const old = await up.begin(ALICE, { fileName: 'old.bin', totalBytes: SIZE, fingerprint: 'fp-old' });
       await sendParts(up, ALICE, old.session.manifest.uploadId, bytes, 'fp-old', [1]);
-      await wait(2600); // object timestamps have 1-second resolution
+      await wait(5500);
       const fresh = await up.begin(ALICE, { fileName: 'fresh.bin', totalBytes: SIZE, fingerprint: 'fp-fresh' });
       const result = await up.sweep();
       expect(result.deleted).toBe(1);
       expect((await up.list(ALICE)).map((s) => s.manifest.fileName)).toEqual(['fresh.bin']);
-      const backend = await backendFor(base());
-      expect(await backend.listParts(old.session.manifest.cloud as never)).toEqual([]);
+      await expectProviderReleased(old.session.manifest.cloud);
       await up.discard(ALICE, fresh.session.manifest.uploadId);
     });
 

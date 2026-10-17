@@ -18,14 +18,17 @@
 // into presigned URLs the browser then cannot satisfy.
 // ---------------------------------------------------------------------------
 
+import { randomBytes } from 'node:crypto';
+
 import type * as S3Sdk from '@aws-sdk/client-s3';
 import type * as S3Presigner from '@aws-sdk/s3-request-presigner';
 
+import { destinationExists } from '../../core/errors.js';
 import type { CloudSessionRef } from '../../core/session.js';
 import type { StorageAdapter, StoredObjectInfo } from '../adapter.js';
 import { base64ToHex, compositeSha256, hexToBase64 } from './checksums.js';
 import { loadOptional } from './load-optional.js';
-import type { CloudBackend, CloudCommitResult, CloudPart, DirectPartRequest } from './types.js';
+import { ProviderSessionLostError, type CloudBackend, type CloudCommitResult, type CloudPart, type DirectPartRequest } from './types.js';
 
 export interface S3BackendConfig {
   readonly kind: 'aws_s3' | 'minio';
@@ -44,6 +47,9 @@ type Sdk = typeof S3Sdk;
 function statusOf(err: unknown): number | undefined {
   return (err as { $metadata?: { httpStatusCode?: number } } | null)?.$metadata?.httpStatusCode;
 }
+
+/** Object metadata key carrying the session's tag (x-amz-meta-mpusession). */
+const SESSION_METADATA = 'mpusession';
 
 function isNotFound(err: unknown): boolean {
   const name = (err as { name?: string } | null)?.name;
@@ -255,11 +261,20 @@ export async function createS3Backend(config: S3BackendConfig): Promise<CloudBac
     supportsDirect: true,
 
     async createSession(key, contentType) {
+      // The tag travels as metadata of the multipart upload, and S3 gives it to
+      // the object only a completion of THIS upload creates.
+      const objectTag = randomBytes(8).toString('hex');
       const created = await client.send(
-        new sdk.CreateMultipartUploadCommand({ Bucket, Key: full(key), ContentType: contentType, ChecksumAlgorithm: 'SHA256' }),
+        new sdk.CreateMultipartUploadCommand({
+          Bucket,
+          Key: full(key),
+          ContentType: contentType,
+          ChecksumAlgorithm: 'SHA256',
+          Metadata: { [SESSION_METADATA]: objectTag },
+        }),
       );
       if (!created.UploadId) throw new Error('S3 did not return an UploadId');
-      return { kind: config.kind, key, uploadId: created.UploadId };
+      return { kind: config.kind, key, uploadId: created.UploadId, objectTag };
     },
 
     async abortSession(session) {
@@ -314,25 +329,70 @@ export async function createS3Backend(config: S3BackendConfig): Promise<CloudBac
 
     async commit(session, parts, _contentType): Promise<CloudCommitResult> {
       const ordered = [...parts].sort((a, b) => a.index - b.index);
-      await client.send(
-        new sdk.CompleteMultipartUploadCommand({
-          Bucket,
-          Key: full(session.key),
-          UploadId: uploadIdOf(session),
-          MultipartUpload: {
-            Parts: ordered.map((p) => ({
-              PartNumber: p.index,
-              ETag: p.etag,
-              ...(p.sha256 ? { ChecksumSHA256: hexToBase64(p.sha256) } : {}),
-            })),
-          },
-        }),
-      );
+      const complete = (onlyIfFree: boolean) =>
+        client.send(
+          new sdk.CompleteMultipartUploadCommand({
+            Bucket,
+            Key: full(session.key),
+            UploadId: uploadIdOf(session),
+            MultipartUpload: {
+              Parts: ordered.map((p) => ({
+                PartNumber: p.index,
+                ETag: p.etag,
+                ...(p.sha256 ? { ChecksumSHA256: hexToBase64(p.sha256) } : {}),
+              })),
+            },
+            // Atomic "only if the key is free" (S3 since 2024, MinIO, VersityGW):
+            // no other upload's object can be replaced, whatever destination()
+            // returned. A refusal can also meet this upload's OWN object — the
+            // SDK retrying a commit whose response was lost — which the caller
+            // tells apart with holdsOwnCommit.
+            ...(onlyIfFree ? { IfNoneMatch: '*' } : {}),
+          }),
+        );
+      try {
+        await complete(true).catch(async (err: unknown) => {
+          // A store that does not implement the condition (501) — it cannot be
+          // made atomic there; the caller's early look is all that remains.
+          if (statusOf(err) === 501 || (err as { name?: string } | null)?.name === 'NotImplemented') return complete(false);
+          throw err;
+        });
+      } catch (err) {
+        // 412: the key is taken.
+        if (statusOf(err) === 412) throw destinationExists();
+        // 409 ConditionalRequestConflict: a concurrent write of the key won, and
+        // S3 drops this multipart upload ("must be re-initiated"). Not a taken
+        // key — the caller starts the session over.
+        if (statusOf(err) === 409) throw new ProviderSessionLostError('A concurrent write to the storage key cancelled this upload.');
+        throw err;
+      }
       return {
         key: session.key,
         size: ordered.reduce((sum, p) => sum + p.size, 0),
         checksum: compositeSha256(ordered.map((p) => p.sha256)),
       };
+    },
+
+    async holdsOwnCommit(session) {
+      // Parts still listed: the upload was not completed.
+      if ((await listParts(session)).length > 0) return false;
+      if (!session.objectTag) {
+        // A session started before tags existed. Its parts are consumed only by
+        // completing it — or by aborting it, which stores nothing — so no parts
+        // plus an object is taken as its commit. A lifecycle rule that aborted
+        // it while another upload wrote the key is the case this cannot tell apart.
+        return Boolean(await control.stat(session.key));
+      }
+      // The object's own metadata names the session that created it — which
+      // also rules out that lifecycle case: the other upload's object carries
+      // its own tag, or none.
+      try {
+        const head = await client.send(new sdk.HeadObjectCommand({ Bucket, Key: full(session.key) }));
+        return head.Metadata?.[SESSION_METADATA] === session.objectTag;
+      } catch (err) {
+        if (isNotFound(err)) return false;
+        throw err;
+      }
     },
 
     readObjectHead: (key, byteCount) => control.readHead(key, byteCount),
