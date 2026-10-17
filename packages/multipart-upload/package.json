@@ -1,6 +1,6 @@
 {
   "name": "@mr_innovations/multipart-upload",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Resumable multipart file uploads for Next.js — server route handlers, browser client and React hook. No database: the filesystem is the state.",
   "keywords": [
     "upload",
