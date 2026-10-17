@@ -12,8 +12,10 @@
 // percentage, and 100% is reserved for a COMPLETED assembly — assembling a large
 // file is a real multi-second wait that must not look like a hang.
 //
-// THROTTLING ACTUALLY THROTTLES. On a 429 the upload drops to one part at a time
-// for the rest of the run. The original implementation set `concurrency = 1` but
+// THROTTLING ACTUALLY THROTTLES — AND RECOVERS. On a 429 (or a storage 503) the
+// upload drops to one part at a time, then earns concurrency back one part at a
+// time after runs of successes, up to the configured `concurrency`; another
+// throttle signal drops it to one again. The original implementation set `concurrency = 1` but
 // its workers were already running and each kept pulling from the queue, so the
 // drop never took effect. Two rules close it here:
 //
@@ -33,135 +35,27 @@
 import { UploadClientError, isRetryable } from './errors.js';
 import { fingerprintFor } from './fingerprint.js';
 import { md5Base64 } from './md5.js';
-import { type PartSender, xhrPartSender } from './transport.js';
+import { xhrPartSender } from './transport.js';
+import { backoffFor, delay, errorFrom, sha256Hex } from './upload-helpers.js';
+import type { StartUploadOptions, UploadHandle, UploadPhase, UploadResult, UploadStartInfo } from './upload-types.js';
 
 export const FINGERPRINT_HEADER = 'x-upload-fingerprint';
 /** Lowercase hex SHA-256 of a part, verified by the server before it is written. */
 export const PART_CHECKSUM_HEADER = 'x-part-sha256';
 
-/**
- * SHA-256 of a part, or null where the browser cannot compute it.
- *
- * `crypto.subtle` exists only in secure contexts (HTTPS, or localhost). On a
- * plain-HTTP host the checksum is skipped and the server does not verify — the
- * upload still works, without the transit-integrity guarantee.
- */
-async function sha256Hex(bytes: ArrayBuffer): Promise<string | null> {
-  const subtle = globalThis.crypto?.subtle;
-  if (!subtle) return null;
-  const digest = new Uint8Array(await subtle.digest('SHA-256', bytes));
-  let hex = '';
-  for (const byte of digest) hex += byte.toString(16).padStart(2, '0');
-  return hex;
-}
-
 const DEFAULT_CONCURRENCY = 4;
 const DEFAULT_MAX_ATTEMPTS = 5;
-const BASE_BACKOFF_MS = 500;
-const MAX_BACKOFF_MS = 30_000;
 
-export type UploadPhase = 'starting' | 'uploading' | 'throttled' | 'assembling' | 'done';
-
-export interface UploadProgress {
-  readonly percent: number;
-  readonly sentBytes: number;
-  readonly totalBytes: number;
-  readonly partsDone: number;
-  readonly partsTotal: number;
-  readonly phase: UploadPhase;
-}
-
-/** What the server reported when the upload began or resumed. */
-export interface UploadStartInfo {
-  readonly uploadId: string;
-  readonly partCount: number;
-  readonly partBytes: number;
-  /** Bytes already on the server — non-zero means this is a resume. */
-  readonly receivedBytes: number;
-  readonly resumed: boolean;
-  readonly maxFileBytes: number;
-  /** 'proxy': parts go through the server. 'direct': straight to the storage. */
-  readonly transfer: 'proxy' | 'direct';
-}
-
-/** The stored file's checksum, as the server reports it. */
-export interface UploadChecksum {
-  readonly type: 'sha256' | 'sha256-composite';
-  readonly value: string;
-  readonly parts?: number;
-}
-
-/** The server's response to `complete`. */
-export interface UploadResult {
-  readonly uploadId: string;
-  readonly fileName: string;
-  readonly key: string;
-  readonly size: number;
-  /** Exact SHA-256 of the stored file — local storage. Empty for cloud storage; see `checksum`. */
-  readonly sha256: string;
-  /** `sha256` (local) or `sha256-composite` (cloud), or null when none was verified. */
-  readonly checksum: UploadChecksum | null;
-  /** The stored file's type — detected from its content where the format allows. */
-  readonly contentType: string;
-  readonly deduplicated: boolean;
-  /** Whatever the server's `onComplete` returned. */
-  readonly result: unknown;
-}
-
-export type HeadersOption = Record<string, string> | (() => Record<string, string> | Promise<Record<string, string>>);
-
-export interface StartUploadOptions {
-  readonly file: Blob & { readonly name: string; readonly lastModified?: number };
-  /** URL the server route is mounted at. Default '/api/uploads'. */
-  readonly endpoint?: string;
-  /** Extra headers on every request — or a function, for tokens that refresh. */
-  readonly headers?: HeadersOption;
-  /** JSON object stored with the upload and handed to the server's `onComplete`. */
-  readonly metadata?: Record<string, unknown>;
-  /** Parts in flight at once. Default 4; drops to 1 for the rest of the run on a 429. */
-  readonly concurrency?: number;
-  readonly maxAttemptsPerPart?: number;
-  readonly credentials?: RequestCredentials;
-  readonly onStart?: (info: UploadStartInfo) => void;
-  readonly onProgress?: (progress: UploadProgress) => void;
-  /** Advanced: replace fetch for the control requests (begin/complete/discard). */
-  readonly fetch?: typeof fetch;
-  /** Advanced: replace the XMLHttpRequest part sender. */
-  readonly sendPart?: PartSender;
-}
-
-export interface UploadHandle {
-  readonly promise: Promise<UploadResult>;
-  /** Stop sending but KEEP the server's parts, so the same file resumes later. */
-  pause(): void;
-  /** Stop and delete the server's parts. The only destructive action. */
-  discard(): Promise<void>;
-  /** Known once the server has answered `begin`. */
-  readonly uploadId: string | null;
-}
-
-/** Wait, event-driven; resolves early when `signal` aborts. */
-function delay(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const timer = AbortSignal.timeout(ms);
-    const done = () => resolve();
-    timer.addEventListener('abort', done, { once: true });
-    signal.addEventListener('abort', done, { once: true });
-  });
-}
-
-function backoffFor(attempt: number, retryAfterSeconds: number | null): number {
-  if (retryAfterSeconds !== null && retryAfterSeconds > 0) return Math.min(retryAfterSeconds * 1000, MAX_BACKOFF_MS);
-  const exponential = Math.min(BASE_BACKOFF_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS);
-  // Jitter, so parts that failed together do not all return at once.
-  return Math.round(exponential * (0.5 + Math.random() * 0.5));
-}
-
-function errorFrom(status: number, body: unknown, fallback: string): UploadClientError {
-  const error = (body as { error?: { message?: string; code?: string; details?: Record<string, unknown> } } | null)?.error;
-  return new UploadClientError(error?.message ?? fallback, status, error?.code, error?.details);
-}
+export type {
+  HeadersOption,
+  StartUploadOptions,
+  UploadChecksum,
+  UploadHandle,
+  UploadPhase,
+  UploadProgress,
+  UploadResult,
+  UploadStartInfo,
+} from './upload-types.js';
 
 export function startUpload(options: StartUploadOptions): UploadHandle {
   const { file, onProgress } = options;
@@ -169,13 +63,36 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
   const fetchImpl = options.fetch ?? fetch.bind(globalThis);
   const sendPart = options.sendPart ?? xhrPartSender;
   const credentials = options.credentials ?? 'same-origin';
-  const maxAttempts = options.maxAttemptsPerPart ?? DEFAULT_MAX_ATTEMPTS;
+  // A whole number of at least 1, so the retry limit is always reached.
+  const requestedAttempts = Math.floor(options.maxAttemptsPerPart ?? DEFAULT_MAX_ATTEMPTS);
+  const maxAttempts = Number.isFinite(requestedAttempts) ? Math.max(1, requestedAttempts) : DEFAULT_MAX_ATTEMPTS;
   // Computed at the start of run(): it reads two small samples of the file.
   let fingerprint = '';
   const controller = new AbortController();
 
   let uploadId: string | null = null;
-  let concurrency = Math.max(1, options.concurrency ?? DEFAULT_CONCURRENCY);
+  // A whole number of at least 1: a fractional limit would let the slot loop run
+  // one more worker than configured, and NaN none at all.
+  // (Infinity stays Infinity — "no limit" — and is capped at the part count.)
+  const requestedConcurrency = Math.floor(options.concurrency ?? DEFAULT_CONCURRENCY);
+  const maxConcurrency = Number.isNaN(requestedConcurrency) ? DEFAULT_CONCURRENCY : Math.max(1, requestedConcurrency);
+  let concurrency = maxConcurrency;
+  // Successes since concurrency last changed; drives the additive increase.
+  let successStreak = 0;
+  // Until when (performance.now() ms, a monotonic clock) successes do not count
+  // toward recovery: the backoff the last throttle signal asked for. Ramping up
+  // while the limiter is still saying "wait" would put the throttled part back
+  // alongside others.
+  let rampHoldUntil = 0;
+  // Counts throttle signals. A part that STARTED before the latest one says
+  // nothing about whether the limiter has recovered, so its success does not count.
+  let throttleEpoch = 0;
+  // Set when a part has failed for good: the other workers stop retrying theirs,
+  // and any of them waiting out a backoff is woken (not a pause: no PAUSED).
+  let abandoned = false;
+  const abandon = new AbortController();
+  // Set by run(): starts a worker for every slot the limit now allows.
+  let startWorkers: () => void = () => undefined;
   let phase: UploadPhase = 'starting';
   let partBytes = 0;
   let partCount = 0;
@@ -197,7 +114,7 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
     const sentBytes = Math.min(sent, file.size);
     const percent =
       phase === 'done' ? 100 : Math.min(99, file.size === 0 ? 0 : Math.round((sentBytes / file.size) * 100));
-    onProgress({ percent, sentBytes, totalBytes: file.size, partsDone: settled.size, partsTotal: partCount, phase });
+    onProgress({ percent, sentBytes, totalBytes: file.size, partsDone: settled.size, partsTotal: partCount, phase, concurrency });
   }
 
   /**
@@ -240,6 +157,27 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
   const attemptsByPart = new Map<number, number>();
 
   /**
+   * Additive increase after throttling: one more part at once after each run of
+   * `max(2, concurrency)` successes — about one "window" of parts going through
+   * cleanly — up to the configured concurrency. A success counts only when its
+   * part started after the latest throttle signal (`startedInEpoch`) and the
+   * backoff that signal asked for has passed; a throttle signal resets the
+   * count (see uploadOne), so an upload that keeps being limited stays slow.
+   */
+  function recordSuccess(startedInEpoch: number): void {
+    if (startedInEpoch !== throttleEpoch || performance.now() < rampHoldUntil) return;
+    if (concurrency < maxConcurrency) {
+      successStreak += 1;
+      if (successStreak < Math.max(2, concurrency)) return;
+      concurrency += 1;
+      successStreak = 0;
+      startWorkers();
+    }
+    // Back at the configured limit — immediately so when that limit is 1.
+    if (concurrency === maxConcurrency && phase === 'throttled') phase = 'uploading';
+  }
+
+  /**
    * Upload one part, retrying on retryable failures.
    * @returns 'done', or 'requeue' when this worker's slot was withdrawn by a 429
    *   and the part must be retried by the remaining worker instead.
@@ -267,9 +205,16 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
       report();
     };
     for (;;) {
+      if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
+      // Re-checked before EVERY attempt, the first included: a throttle that
+      // arrived while this part was being read and hashed has withdrawn the slot.
+      if (slot >= concurrency) return 'requeue';
       const attempt = (attemptsByPart.get(index) ?? 0) + 1;
       attemptsByPart.set(index, attempt);
-      if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
+      // Another part failed for good: the upload is over, so no more attempts
+      // (the upload ends with that part's error, not this one).
+      if (abandoned) throw new UploadClientError('Stopped: another part failed.', 0);
+      const startedInEpoch = throttleEpoch;
       // Direct transfer: whether this attempt reached the STORAGE — a failure
       // before that came from the app's own server (the signing request).
       let reachedStorage = false;
@@ -312,6 +257,7 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
       if (!failure) {
         settled.add(index);
         sentByPart.set(index, body.byteLength); // pinned: never written again
+        recordSuccess(startedInEpoch);
         report();
         return 'done';
       }
@@ -327,20 +273,23 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
       // fresh URL and a resend, within the attempt limit. The same statuses from
       // the app's own server (the signing request) are final, as everywhere else.
       const retryableDirect = reachedStorage && !failure.code && (failure.status === 400 || failure.status === 403);
-      if ((!retryableDirect && !isRetryable(failure.status, failure.code)) || attempt === maxAttempts) throw failure;
+      if ((!retryableDirect && !isRetryable(failure.status, failure.code)) || attempt >= maxAttempts) throw failure;
 
+      const wait = backoffFor(attempt, (failure as { retryAfterSeconds?: number | null }).retryAfterSeconds ?? null);
       // S3 throttles with 503 SlowDown and Azure with 503 ServerBusy, not 429.
       if (failure.status === 429 || (reachedStorage && failure.status === 503)) {
-        // Self-limit for the rest of the run rather than oscillate: an upload that
-        // finishes slowly beats one that keeps tripping the limiter.
+        // Down to one part at once: the limiter gets real relief, and the
+        // remaining worker takes this part next (see the file header).
         concurrency = 1;
+        successStreak = 0;
+        throttleEpoch += 1;
+        rampHoldUntil = Math.max(rampHoldUntil, performance.now() + wait);
         phase = 'throttled';
       }
       report();
-      await delay(backoffFor(attempt, (failure as { retryAfterSeconds?: number | null }).retryAfterSeconds ?? null), controller.signal);
-      // Re-checked AFTER the backoff: another worker's 429 may have withdrawn
-      // this slot while it waited.
-      if (slot >= concurrency) return 'requeue';
+      // The loop's first check runs again after the backoff: another worker's
+      // 429 may have withdrawn this slot while it waited.
+      await delay(wait, controller.signal, abandon.signal);
     }
   }
 
@@ -415,18 +364,42 @@ export function startUpload(options: StartUploadOptions): UploadHandle {
           }
         } catch (err) {
           failure ??= err;
+          abandoned = true;
+          abandon.abort();
           return;
         }
       }
     }
 
-    // Rounds, not one pass: a part can be requeued after the surviving worker has
-    // already found the queue empty and stopped. Without another round that part
-    // would never be sent and `complete` would fail as INCOMPLETE. Terminates:
-    // once concurrency is 1, slot 0 can never be withdrawn, so nothing requeues.
-    while (queue.length > 0 && !failure && !controller.signal.aborted) {
-      await Promise.all(Array.from({ length: concurrency }, (_, slot) => worker(slot)));
+    // A pool, not a fixed set: a worker is started for every slot the limit
+    // allows — at the start, whenever the limit rises again after throttling,
+    // and after any worker stops (a part it requeued may need a worker: the
+    // others may have found the queue empty already, and without one that part
+    // would never be sent and `complete` would fail as INCOMPLETE). Terminates:
+    // workers only start while parts are queued, and a requeue never comes from
+    // slot 0, which a lower limit can never withdraw.
+    const activeSlots = new Set<number>();
+    const running = new Set<Promise<void>>();
+    startWorkers = () => {
+      // No more workers than parts: also what makes `concurrency: Infinity` work.
+      const limit = Math.min(concurrency, partCount);
+      for (let slot = 0; slot < limit; slot += 1) {
+        if (queue.length === 0 || failure || controller.signal.aborted) break;
+        if (activeSlots.has(slot)) continue;
+        activeSlots.add(slot);
+        const job: Promise<void> = worker(slot).finally(() => {
+          activeSlots.delete(slot);
+          running.delete(job);
+        });
+        running.add(job);
+      }
+    };
+    startWorkers();
+    while (running.size > 0) {
+      await Promise.race(running);
+      startWorkers();
     }
+    startWorkers = () => undefined;
     if (failure) throw failure;
     if (controller.signal.aborted) throw new UploadClientError('Paused.', 0, 'PAUSED');
 

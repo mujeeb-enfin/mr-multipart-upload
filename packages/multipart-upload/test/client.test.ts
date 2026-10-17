@@ -104,9 +104,9 @@ describe('startUpload', () => {
     expect(result.sha256).toBe(sha256(bytes));
   });
 
-  it('retries a 429 and then really runs one part at a time', async () => {
-    // MUTATION: remove the worker slot check -> after the 429 four parts still
-    // run concurrently and `maxAfterThrottle` is 4.
+  it('retries a 429, really runs one part at a time, then earns concurrency back', async () => {
+    // MUTATION: remove the worker slot check -> while the limit is 1, four parts
+    // still run concurrently and `maxConcurrencyWhileLimited` is 4.
     // Sized so the overlap is GUARANTEED, not likely: the throttled part retries
     // after a fixed 200 ms Retry-After, and the surviving worker still has ~20
     // parts x 60 ms = 1.2 s of work at that moment. An earlier version used 12
@@ -119,17 +119,109 @@ describe('startUpload', () => {
     expect(run.phases.has('throttled')).toBe(true);
     // MUTATION: retry the throttled part in place instead of requeueing it -> it
     // goes back on the wire while the surviving worker is mid-part: 2 at once.
+    // MUTATION: drop the ramp hold (successes counting during the Retry-After
+    // wait) -> the limit is already back up when the retry starts: 2 at once.
     // Measured at the exact moment of the retry, not over a counted window — an
     // earlier count-based version caught this only when the timing happened to
     // line up (5/5 in isolation, missed in a full-file run).
     expect(run.inFlightAtRetry).toBe(1);
     // Parts already running when the 429 arrives are allowed to finish; every part
-    // that STARTS after that drain window must run alone.
-    expect(run.maxConcurrencyAfterDrain).toBe(1);
+    // that STARTS after that drain window while the limit is 1 must run alone.
+    expect(run.partsStartedWhileLimited).toBeGreaterThan(0);
+    expect(run.maxConcurrencyWhileLimited).toBe(1);
     // And before the 429 it really was concurrent — otherwise the check above
     // would pass for an uploader that never parallelised at all.
     expect(run.maxConcurrencyBefore).toBeGreaterThan(1);
+    // Recovery: the limit climbs back to the configured 4, parts really overlap
+    // again, and nothing ever exceeds 4.
+    // MUTATION: drop the increase in recordSuccess -> the limit stays at 1.
+    expect(run.highestLimitAfterThrottle).toBe(4);
+    expect(run.maxConcurrencyAfterRecovery).toBeGreaterThan(1);
+    expect(run.maxConcurrencyOverall).toBeLessThanOrEqual(4);
   }, 30_000);
+
+  it('with concurrency 1, a throttle does not leave the upload reported as throttled for good', async () => {
+    // At a limit of 1 there is nothing to earn back; the phase must still
+    // return to 'uploading' once parts go through again.
+    // MUTATION: return from recordSuccess before the phase reset when already
+    // at the maximum -> the phase stays 'throttled' until 'assembling'.
+    let throttled = false;
+    const phases: string[] = [];
+    const sender: PartSender = async (req) => {
+      if (!throttled && req.url.endsWith('/parts/1')) {
+        throttled = true;
+        return { status: 429, body: { error: { code: 'RATE_LIMITED', message: 'slow down' } }, retryAfterSeconds: 0.05 };
+      }
+      return fetchPartSender(dispatch)(req);
+    };
+    await startUpload({
+      file: fileFrom(patternBytes(4 * MIB), 'one.bin'),
+      headers: auth,
+      fetch: dispatch,
+      sendPart: sender,
+      concurrency: 1,
+      onProgress: (p) => phases.push(p.phase),
+    }).promise;
+    const afterThrottle = phases.slice(phases.indexOf('throttled'));
+    expect(afterThrottle).toContain('uploading');
+    expect(afterThrottle.indexOf('uploading')).toBeLessThan(afterThrottle.indexOf('assembling'));
+  });
+
+  it('only parts started after a throttle count toward earning concurrency back', async () => {
+    // Slow parts and a short Retry-After: the parts already on the wire when
+    // the 429 arrives finish AFTER the backoff, but they went out under the old
+    // limit and prove nothing about the limiter.
+    // MUTATION: ignore the throttle epoch in recordSuccess -> those parts raise
+    // the limit before any post-throttle part has succeeded.
+    let throttledAt = -1;
+    let started = 0;
+    let postThrottleSuccesses = 0;
+    let successesAtFirstRaise = -1;
+    let lastLimit = 4;
+    const sender: PartSender = async (req) => {
+      started += 1;
+      const startedAfterThrottle = throttledAt >= 0;
+      await tick(req.url.endsWith('/parts/2') && throttledAt < 0 ? 20 : 400);
+      if (throttledAt < 0 && req.url.endsWith('/parts/2')) {
+        throttledAt = started;
+        return { status: 429, body: { error: { code: 'RATE_LIMITED', message: 'slow down' } }, retryAfterSeconds: 0.05 };
+      }
+      const response = await fetchPartSender(dispatch)(req);
+      if (startedAfterThrottle && response.status < 300) postThrottleSuccesses += 1;
+      return response;
+    };
+    await startUpload({
+      file: fileFrom(patternBytes(12 * MIB), 'epoch.bin'),
+      headers: auth,
+      fetch: dispatch,
+      sendPart: sender,
+      concurrency: 4,
+      onProgress: (p) => {
+        if (throttledAt >= 0 && p.concurrency > lastLimit && successesAtFirstRaise < 0) successesAtFirstRaise = postThrottleSuccesses;
+        lastLimit = p.concurrency;
+      },
+    }).promise;
+    expect(throttledAt).toBeGreaterThan(0);
+    expect(successesAtFirstRaise).toBeGreaterThanOrEqual(2);
+  }, 30_000);
+
+  it('runs a fractional concurrency as its whole number, never above it', async () => {
+    // MUTATION: drop the Math.floor -> 2.5 runs three parts at once.
+    let inFlight = 0;
+    let peak = 0;
+    const sender: PartSender = async (req) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      try {
+        await tick(30);
+        return await fetchPartSender(dispatch)(req);
+      } finally {
+        inFlight -= 1;
+      }
+    };
+    await startUpload({ file: fileFrom(patternBytes(8 * MIB), 'frac.bin'), headers: auth, fetch: dispatch, sendPart: sender, concurrency: 2.5 }).promise;
+    expect(peak).toBe(2);
+  });
 
   it('treats a non-retryable 4xx as terminal after ONE attempt', async () => {
     let attempts = 0;
@@ -310,30 +402,57 @@ async function throttledRun(bytes: Uint8Array<ArrayBuffer>) {
   let started = 0;
   let throttledAt = -1;
   let maxConcurrencyBefore = 0;
-  let maxConcurrencyAfterDrain = 0;
+  let maxConcurrencyWhileLimited = 0;
+  let partsStartedWhileLimited = 0;
+  let maxConcurrencyAfterRecovery = 0;
+  let maxConcurrencyOverall = 0;
   let rejected429 = 0;
   let inFlightAtRetry = -1;
+  // The client's own limit, as last reported through onProgress.
+  let limit = 4;
+  let highestLimitAfterThrottle = 0;
+  let recovered = false;
   const phases = new Set<string>();
+  // Parts on the wire, and those that still were when the 429 arrived: they are
+  // allowed to finish; only parts starting after they have drained are measured.
+  const onWire = new Set<symbol>();
+  let undrained: Set<symbol> | null = null;
+  // The most parts on the wire at any moment while the retry of the throttled
+  // part is itself on the wire — not only when it starts.
+  let retryOnWire = false;
 
   const sender: PartSender = async (req) => {
+    const me = Symbol(req.url);
     started += 1;
     inFlight += 1;
+    onWire.add(me);
+    maxConcurrencyOverall = Math.max(maxConcurrencyOverall, inFlight);
     // The second call for part 2 is the retry of the throttled part.
-    if (throttledAt >= 0 && req.url.endsWith('/parts/2')) inFlightAtRetry = inFlight;
+    const isRetry = throttledAt >= 0 && req.url.endsWith('/parts/2');
+    if (isRetry) {
+      retryOnWire = true;
+      inFlightAtRetry = inFlight;
+    } else if (retryOnWire) inFlightAtRetry = Math.max(inFlightAtRetry, inFlight);
     if (throttledAt < 0) maxConcurrencyBefore = Math.max(maxConcurrencyBefore, inFlight);
-    // `+ 4`: up to four parts (the initial concurrency) were already running.
-    else if (started > throttledAt + 4) maxConcurrencyAfterDrain = Math.max(maxConcurrencyAfterDrain, inFlight);
+    else if (undrained?.size === 0 && limit === 1 && !recovered) {
+      partsStartedWhileLimited += 1;
+      maxConcurrencyWhileLimited = Math.max(maxConcurrencyWhileLimited, inFlight);
+    } else if (recovered) maxConcurrencyAfterRecovery = Math.max(maxConcurrencyAfterRecovery, inFlight);
     try {
       await tick(60);
       if (throttledAt < 0 && req.url.endsWith('/parts/2')) {
         throttledAt = started;
         rejected429 += 1;
+        undrained = new Set([...onWire].filter((part) => part !== me));
         // A fixed Retry-After removes backoff jitter from the timing.
         return { status: 429, body: { error: { code: 'RATE_LIMITED', message: 'slow down' } }, retryAfterSeconds: 0.2 };
       }
       return await fetchPartSender(dispatch)(req);
     } finally {
       inFlight -= 1;
+      onWire.delete(me);
+      undrained?.delete(me);
+      if (isRetry) retryOnWire = false;
     }
   };
 
@@ -343,7 +462,23 @@ async function throttledRun(bytes: Uint8Array<ArrayBuffer>) {
     fetch: dispatch,
     sendPart: sender,
     concurrency: 4,
-    onProgress: (p) => phases.add(p.phase),
+    onProgress: (p) => {
+      phases.add(p.phase);
+      limit = p.concurrency;
+      if (throttledAt >= 0) highestLimitAfterThrottle = Math.max(highestLimitAfterThrottle, p.concurrency);
+      if (throttledAt >= 0 && p.concurrency === 4) recovered = true;
+    },
   }).promise;
-  return { sha256: result.sha256, rejected429, phases, maxConcurrencyBefore, maxConcurrencyAfterDrain, inFlightAtRetry };
+  return {
+    sha256: result.sha256,
+    rejected429,
+    phases,
+    maxConcurrencyBefore,
+    maxConcurrencyWhileLimited,
+    partsStartedWhileLimited,
+    maxConcurrencyAfterRecovery,
+    maxConcurrencyOverall,
+    highestLimitAfterThrottle,
+    inFlightAtRetry,
+  };
 }
