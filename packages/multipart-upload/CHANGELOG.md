@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.1
+
+### Changed
+
+- **Throttling recovers.** After a 429 (or a storage 503) the upload still drops to one part at a time, then earns concurrency back once the requested backoff has passed: one more part at once after each run of `max(2, current)` successes, up to `concurrency`. Previously it stayed at one part for the rest of the upload. `UploadProgress` gains `concurrency`, the current limit; `phase` stays `'throttled'` until it is back at the maximum.
+
+### Fixed
+
+- **Two requests can no longer both take over an abandoned complete lock.** Taking over used to delete the stale lock and create it again — two steps that two takers could interleave, the second deleting the first one's fresh lock. Locks are now generations (`completing.<n>.lock`) and a takeover creates the next one exclusively, so exactly one wins; each lock also carries its holder's token, so a reused generation number never fools a stalled holder. The holder refreshes the lock between long steps (including during Azure's copy) and confirms it still holds it before every irreversible step — publishing, committing, recording, and cleaning up — so a request that stalled past `lockStaleMs` stops instead of committing, running `onComplete` again, or deleting what the request that took over is using. Each holder assembles into its own staging file. Locks written by 0.3.0 are honoured; do not run 0.3.0 and 0.3.1 side by side (0.3.0 does not see the new locks).
+- **Commits onto a taken key are refused atomically.** The cloud commit is conditional — `If-None-Match: *` on S3 / MinIO `CompleteMultipartUpload`, a destination condition on Azure's `Put Block List` and copy — so two uploads committing onto one key at the same moment cannot both store; the early existence check remains for a friendly error. Local storage publishes with a hard link, which refuses an existing target, instead of a replacing rename.
+- **"This object is our own commit" is proved, not guessed** (`holdsOwnCommit`): every S3 / MinIO multipart upload is stamped with a random session tag (object metadata `x-amz-meta-mpusession`) that S3 gives only to the object that upload's completion creates — so an object another upload wrote at the key, even after a lifecycle rule aborted this one, is never claimed or deleted (sessions started on 0.3.0 have no tag and keep the earlier evidence: no parts left and an object at the key); an Azure blob's committed blocks carry the session's tag; an Azure staged copy records the session's staging blob as its source. Recovery, discard and the sweep use it, so none can claim or delete another upload's object at a shared key. A commit whose response was lost — the SDK's retry then refused as a taken key — is recognised as the upload's own and finishes, instead of stranding it.
+- **Azure copy:** a copy of this session's still running is awaited rather than restarted; a staging blob rewritten during the commit is reported as such, not as a taken key; the lock heartbeat runs one refresh at a time, at most every 30 s, and finishes before the commit returns.
+- **Client:** `concurrency` is used as a whole number (2.5 → 2); with `concurrency: 1` the phase returns to `'uploading'` after a throttle; only parts started after a throttle count toward recovery; the backoff hold uses a monotonic clock; once a part has failed for good, the other parts stop retrying.
+- **Azure: uploads sharing a blob no longer mix blocks.** Azure keeps uncommitted blocks per blob, so two uploads given the same key by a custom `destination()` could each list — and commit — the other's blocks, storing a file spliced from both. Every block id now carries a per-session tag, and each session lists only its own. Sessions started before 0.3.1 keep untagged ids and resume unchanged.
+- **Azure proxy transfer: discard and the sweep no longer delete the blob.** Between "no stored file here yet" and the delete, another upload given the same key could commit its file there, and the delete destroyed it. The session's uncommitted blocks are left to Azure's own cleanup (about 7 days); their tag keeps every later session from using them.
+- **Local storage, custom `destination()`:** a key already taken is refused with `DESTINATION_EXISTS` instead of being reported `deduplicated` — the upload was handed another upload's file, and its `onComplete` recorded it.
+- **Local storage, failing `onComplete`:** a file at the default content-addressed key is no longer removed. Another upload of the same bytes may already have found and recorded it, and removing it lost that record's file. At a custom `destination()` it is still removed, and only while the request still holds the lock.
+- **S3-compatible stores without conditional writes:** a commit rejected as not implemented (501 / `NotImplemented`) is retried without `If-None-Match`, instead of failing the upload.
+- **S3: a commit cancelled by a concurrent write** (409 `ConditionalRequestConflict`, which drops the multipart upload) starts a fresh provider session for the upload instead of failing for good.
+- A staging name that cannot be removed after a local publish (a virus scanner holding it on Windows) no longer fails a `complete` whose file is already stored; cleanup and the sweep remove it.
+
 ## 0.3.0
 
 ### Added

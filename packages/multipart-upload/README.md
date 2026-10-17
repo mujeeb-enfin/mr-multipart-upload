@@ -389,15 +389,15 @@ Add the rule alongside any you already have; it does not need to replace them.
 | `sha256` field | the exact SHA-256 | empty — S3 does not compute a plain SHA-256 of a multipart object | empty |
 | Deduplication | yes | no — the object key is fixed before any byte exists | no |
 | Default stored key | `files/<user hash>/<sha256>.<ext>` | `<prefix>files/<user hash>/<upload id>-<session id>.<ext>` — fixed when the upload begins, kept through pause, reload and resume; a new upload of the same file gets a new one | the same |
-| Commit onto an existing object | — | refused with `DESTINATION_EXISTS`, nothing overwritten, the parts kept | the same |
+| Commit onto an existing object | atomic no-overwrite publish (a hard link; check-then-move on filesystems without hard links); an existing file at the default, content-addressed key is the same bytes (`deduplicated`). With a custom `destination()`, a key already taken is refused with `DESTINATION_EXISTS` — the upload is never handed someone else's file — and the parts are kept | refused with `DESTINATION_EXISTS` atomically by the storage (`If-None-Match`), nothing overwritten, the parts kept | the same, atomically; with proxy transfer and a key shared by concurrent uploads, the refused upload's parts are lost — Azure discards a blob's uncommitted blocks when it commits |
 | Direct transfer | — | parts go to the S3 multipart upload | parts go to a staging blob, copied to the final key at `complete` (one server-side copy) |
-| `onComplete` fails | the file is removed, the parts are kept for a retry | the committed object is kept; a retried `complete` re-runs only `onComplete` | the same |
+| `onComplete` fails | the parts are kept for a retry. At a custom `destination()` the file is removed; at the default content-addressed key it stays — another upload of the same bytes may already have recorded it — and the retry finds it again | the committed object is kept; a retried `complete` re-runs only `onComplete` | the same |
 | Server stops mid-`complete` | parts are kept; the retry assembles again | the retry finishes the committed file (`checksum: null`) — after a reload too, which resumes with nothing left to send; discard or the sweep deletes it | the same |
-| Unfinished uploads | the sweep | the sweep aborts the S3 session; add the lifecycle rule above | proxy: the sweep deletes a blob holding only uncommitted blocks — never a stored file at the same key; direct: it deletes the session's staging blob, committed or not. Azure also discards uncommitted blocks after about 7 days |
+| Unfinished uploads | the sweep | the sweep aborts the S3 session; add the lifecycle rule above | proxy: the sweep removes the upload's control files and leaves its uncommitted blocks to Azure, which discards them after about 7 days — deleting the blob could destroy a file another upload commits at the same key meanwhile; the blocks carry the session's tag, so no later upload can use them. Direct: it deletes the session's staging blob, committed or not |
 
 Configuration is read on every request (so a changed `.env` value takes effect without a restart), and a problem is refused on the first request that meets it — before any byte is stored — with the setting named: a part size under 5 MiB for S3, a maximum size needing more parts than the provider allows, `direct` with local storage or with an Azure SAS token (alone or in a connection string). No error ever contains a secret.
 
-**A custom `destination()` on cloud storage must return a different key for every upload** — use `sessionId`, which is new for each upload session and kept while it resumes. The key is chosen before any byte exists, so `sha256` is empty there; a 0.2.x-style `` `uploads/${sha256}.${extension}` `` would give every upload the same key. A commit onto an object the upload did not create is refused with `DESTINATION_EXISTS` rather than overwriting it. That check runs once, before the upload's first commit attempt; a retry of an attempt that failed part-way trusts the key, so a key shared between uploads is still a mistake, not a supported mode.
+**A custom `destination()` on cloud storage must return a different key for every upload** — use `sessionId`, which is new for each upload session and kept while it resumes. The key is chosen before any byte exists, so `sha256` is empty there; a 0.2.x-style `` `uploads/${sha256}.${extension}` `` would give every upload the same key. A commit onto an object the upload did not create is refused with `DESTINATION_EXISTS` rather than overwriting it — atomically: the commit itself is conditional (`If-None-Match: *` on S3 and MinIO, a destination condition on Azure), so two uploads committing onto one key at the same moment cannot both store. On Azure, every block also carries a per-session tag, so uploads sharing a blob never see, or commit, each other's blocks. A key shared between uploads is still a mistake, not a supported mode — the refused upload has to be sent again. An unrecorded commit is recognised as the upload's own only on proof from the storage: on S3 / MinIO every multipart upload is stamped with a random session tag (object metadata `x-amz-meta-mpusession`), which S3 gives only to the object that upload's completion creates — so an object another upload wrote at the key, even after a lifecycle rule aborted this one, is never claimed or deleted. Uploads started on 0.3.0 have no tag and keep the earlier evidence (no parts left and an object at the key).
 
 **Limitations to know.**
 
@@ -530,14 +530,14 @@ Returns `{ GET, POST, PUT, DELETE, uploader }`. Export the four handlers from yo
 |---|---|
 | `authorize(request)` | **Required.** Return `{ namespace }` — usually the user id — or `null` to refuse with 401. Uploads are isolated per namespace. |
 | `allowAnonymous` | Accept uploads with no `authorize`. All anonymous callers share one namespace. Use only deliberately. |
-| `onComplete(input)` | Called once the file is stored. Receives `{ file, metadata, namespace, uploadId, deduplicated }`. Its return value is sent to the client as `result`. If it throws, a newly stored file is removed and the parts are kept, so the user can retry. |
+| `onComplete(input)` | Called once the file is stored. Receives `{ file, metadata, namespace, uploadId, deduplicated }`. Its return value is sent to the client as `result`. If it throws, the parts are kept, so the user can retry; with local storage a file just stored at a custom `destination()` is removed (one at the default content-addressed key stays — see [Storage backends](#storage-backends-local-s3-minio-azure)). Make it idempotent (key its record by `uploadId`): a retry runs it again, and so can a request that took over after it outlasted `lockStaleMs`. |
 | `validateHead(bytes, info)` | Inspect the first bytes of the file (64 KB by default) before it is assembled. Throw to refuse with 422. The parts are kept. Runs after the `allowedTypes` content check. |
 | `destination(info)` | Choose the storage key of a completed file. `info` holds `sha256`, `extension`, `namespaceKey` and `fileName`; for cloud storage also `uploadId` and `sessionId`. Default: `files/<namespace hash>/<sha256>.<ext>` (local); `files/<namespace hash>/<uploadId>-<sessionId>.<ext>` (cloud, where `sha256` is empty — see [Storage backends](#what-differs-by-backend)). |
 | `basePath` | URL the route is mounted at. Default `/api/uploads`. |
 | `maxMetadataBytes` | Largest metadata object accepted. Default 16 KB. |
 | `headBytes` | Bytes passed to `validateHead`. Default 64 KB. |
 | `sweepOnBegin` | Remove expired unfinished uploads when a new one begins. Default `true` for local storage, `false` for cloud storage — there it would cost a request per stored object on every upload start; sweep on a schedule instead. |
-| `lockStaleMs` | A finishing lock older than this is treated as abandoned. Default 15 minutes. |
+| `lockStaleMs` | A finishing lock older than this is treated as abandoned and taken over. Default 15 minutes. Exactly one request can take over an abandoned lock (each takeover creates the next lock generation exclusively, and each lock carries its holder's token); the holder refreshes its lock between long steps and checks it still holds it before every irreversible step, so a request that stalled past this limit stops instead of finishing the upload a second time — and never cleans up what the request that took over is using. Keep it well above your longest `onComplete` and `validateHead`, and above the longest assembly (local) or provider commit: the lock is not refreshed while any of these runs — only Azure's copy refreshes it, at most every 30 s. An `onComplete` that outlasts the limit can be run a second time by the request that takes over. A custom `StorageAdapter` without `write()` cannot refresh at all, so there the limit must cover the whole `complete`. |
 | `onError(error, request)` | Called for unexpected (500) errors. Default: `console.error`. |
 | `storage` | A custom storage backend (see [Requirements and limitations](#requirements-and-limitations)). |
 | `maxFileBytes`, `partBytes`, `allowedTypes`, `dir`, `partTtlMs`, `instanceId`, `storage`, `transfer`, `directUrlTtlSeconds`, `s3`, `minio`, `azure` | The settings — see [Configuration](#configuration). Each falls back to its `.env` variable, then the default. |
@@ -611,7 +611,7 @@ export async function POST() {
 | `discard()` | Stop and delete the server's parts. |
 | `reset()` | Return to idle without touching the server. |
 | `status` | `'idle' \| 'uploading' \| 'assembling' \| 'paused' \| 'done' \| 'error'` |
-| `progress` | `{ percent, sentBytes, totalBytes, partsDone, partsTotal, phase }` |
+| `progress` | `{ percent, sentBytes, totalBytes, partsDone, partsTotal, phase, concurrency }` — `concurrency` is how many parts may be on the wire right now (lower while recovering from throttling) |
 | `startInfo` | `{ uploadId, resumed, receivedBytes, maxFileBytes, transfer, … }` once the server has answered. |
 | `result` | The completed upload: `{ uploadId, fileName, key, size, sha256, checksum, contentType, deduplicated, result }`, where `result` is whatever `onComplete` returned. |
 | `error` | An `UploadClientError` with `message`, `status`, `code` and `details`. |
@@ -628,13 +628,13 @@ The framework-free engine behind the hook. Returns `{ promise, pause, discard, u
 | `endpoint` | `/api/uploads` | Where the route is mounted. |
 | `headers` | — | Extra headers on every request, or a function returning them (for tokens that refresh). |
 | `metadata` | `{}` | A JSON object stored with the upload and handed to `onComplete`. |
-| `concurrency` | `4` | Parts in flight at once. |
-| `maxAttemptsPerPart` | `5` | |
+| `concurrency` | `4` | Parts in flight at once — a whole number (2.5 → 2, at least 1; `Infinity` means as many as there are parts). |
+| `maxAttemptsPerPart` | `5` | Tries per part, the first included — a whole number of at least 1; a value that is not finite uses the default. |
 | `onStart`, `onProgress` | — | Callbacks. |
 
 `/client` also exports `FILE_TYPES`, for building the picker's `accept` list in the browser.
 
-**Retries.** Network errors, 5xx, 408 and 429 are retried with exponential backoff, honouring `Retry-After`. On a 429 the upload drops to one part at a time for the rest of the run. Other 4xx errors are not retried — they would fail the same way again.
+**Retries.** Network errors, 5xx, 408 and 429 are retried with exponential backoff, honouring `Retry-After`. On a 429 (or a 503 from the storage in direct transfer — S3's SlowDown, Azure's ServerBusy) the upload drops to one part at a time, then **earns concurrency back**: once the requested backoff has passed, each run of `max(2, current)` successful parts — parts that started after the throttle, not ones already on the wire — adds one more part at once, up to `concurrency`. Another throttle drops it to one again. `progress.concurrency` reports the current limit, and `phase` stays `'throttled'` until it is back at the maximum. Other 4xx errors are not retried — they would fail the same way again.
 
 **Progress** never goes backwards, and reaches 100% only after the server has assembled the file.
 
@@ -694,6 +694,18 @@ Each part's name also carries a **tag derived from the fingerprint**, and a part
 
 ---
 
+## Upgrading from 0.3.0
+
+No code changes needed with the default destination; uploads in progress resume. With a custom `destination()`, read the local storage note below.
+
+- **Throttling now recovers** instead of staying at one part at a time for the rest of the upload (see Retries). `progress.concurrency` is new.
+- **Locks are generations** (`completing.<n>.lock`); a lock written by 0.3.0 (`completing.lock`) is still honoured, and taken over once stale. The reverse does not hold — 0.3.0 does not see the new locks — so **do not run 0.3.0 and 0.3.1 side by side** on one storage: finish the rollout (or drain the old instances) before uploads complete on the new ones.
+- **Commits are conditional** on the key being free. An S3-compatible store that rejects the condition as not implemented (501 / `NotImplemented`) is retried without it, which is the earlier check-then-commit; a store that ignores the condition silently behaves the same way (AWS S3 supports it since 2024; VersityGW and current MinIO enforce it).
+- **Local storage with a custom `destination()`:** a key already taken is now refused with `DESTINATION_EXISTS`, instead of being reported `deduplicated` and handed to `onComplete`.
+- **A failing `onComplete` (local storage)** no longer removes a file at the default content-addressed key — another upload of the same bytes may have recorded it. At a custom `destination()` it is still removed.
+- **Azure proxy transfer:** discard and the sweep no longer delete the blob; the session's uncommitted blocks are left to Azure's 7-day cleanup (see Storage backends). Uploads started on 0.3.0 keep untagged block ids and resume unchanged.
+- **Client:** `concurrency` and `maxAttemptsPerPart` are used as whole numbers (see the client options).
+
 ## Upgrading from 0.2.x
 
 Nothing changes unless you opt in: `local` storage and `proxy` transfer stay the defaults, with the same behaviour.
@@ -739,7 +751,7 @@ Every error response is `{ "error": { "code", "message", "details"? } }`.
 | `UNAUTHORIZED` | 401 | `authorize` refused. |
 | `NOT_FOUND` | 404 | Unknown path — check `basePath`. |
 | `CONFIG_INVALID` | 500 | A bad `.env` value or option. The message names it. |
-| `DESTINATION_EXISTS` | 409 | Cloud storage: an object this upload did not create already exists at its key — usually a custom `destination()` that is not unique per upload. Nothing overwritten; the parts are kept. |
+| `DESTINATION_EXISTS` | 409 | An object this upload did not create already exists at its key — on cloud storage, or with local storage and a custom `destination()` — usually a `destination()` that is not unique per upload. Nothing overwritten. The parts are kept — except on Azure with proxy transfer when the other upload committed onto the same blob, which discards them. |
 | `INSECURE_CONTEXT` | — | Client only, direct transfer: the page is not a secure context (HTTPS or `localhost`), so the browser cannot compute the SHA-256 each part is signed with. |
 
 ---
